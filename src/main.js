@@ -1,60 +1,38 @@
+/**
+ * 入口：组装页面骨架，创建活动控制器与卡片列表。
+ * 职责边界：只做装配，不含业务规则与渲染细节。
+ */
+
 import './style.css'
-import heroImg from './assets/hero.png'
-import javascriptLogo from './assets/javascript.svg'
-import viteLogo from './assets/vite.svg'
-import { setupCounter } from './counter.js'
+import { createCampaignController } from './campaign/controller.js'
+import { createCardView } from './campaign/cardView.js'
+import { remainingAttempts, DAILY_ATTEMPTS } from './campaign/stateMachine.js'
 
-document.querySelector('#app').innerHTML = `
-<section id="center">
-  <div class="hero">
-    <img src="${heroImg}" class="base" width="170" height="179">
-    <img src="${javascriptLogo}" class="framework" alt="JavaScript logo"/>
-    <img src="${viteLogo}" class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/main.js</code> and save to test <code>HMR</code></p>
-  </div>
-  <button id="counter" type="button" class="counter"></button>
-</section>
+const CARD_IDS = ['card-1', 'card-2', 'card-3']
 
-<div class="ticks"></div>
+const controller = createCampaignController()
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon"></use></svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank">
-          <img class="logo" src="${viteLogo}" alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript" target="_blank">
-          <img class="button-icon" src="${javascriptLogo}" alt="">
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#social-icon"></use></svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li><a href="https://github.com/vitejs/vite" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#github-icon"></use></svg>GitHub</a></li>
-      <li><a href="https://chat.vite.dev/" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#discord-icon"></use></svg>Discord</a></li>
-      <li><a href="https://x.com/vite_js" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#x-icon"></use></svg>X.com</a></li>
-      <li><a href="https://bsky.app/profile/vite.dev" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#bluesky-icon"></use></svg>Bluesky</a></li>
-    </ul>
-  </div>
-</section>
+const app = document.querySelector('#app')
 
-<div class="ticks"></div>
-<section id="spacer"></section>
-`
+const header = document.createElement('header')
+header.className = 'page-header'
+const title = document.createElement('h1')
+title.textContent = '幸运刮刮卡'
+const attempts = document.createElement('p')
+attempts.className = 'attempts'
+attempts.setAttribute('aria-live', 'polite')
+header.append(title, attempts)
 
-setupCounter(document.querySelector('#counter'))
+const list = document.createElement('main')
+list.className = 'card-list'
+for (const id of CARD_IDS) {
+  list.appendChild(createCardView(controller, id))
+}
+
+app.append(header, list)
+
+function renderAttempts(state) {
+  attempts.textContent = `今日剩余刮卡次数：${remainingAttempts(state)} / ${DAILY_ATTEMPTS}`
+}
+controller.subscribe(renderAttempts)
+renderAttempts(controller.getState())

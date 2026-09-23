@@ -15,7 +15,9 @@
  *   相邻点之间用圆头直线（destination-out）插值，刮痕是连续线段而非离散点；
  * - 状态粘滞防护：pointerdown 时 setPointerCapture，指针拖出卡片/窗口仍持续
  *   收到事件且 pointerup 必定送达；pointercancel / lostpointercapture /
- *   window blur 都会终止当前笔画，不会出现"未按下也在刮"。
+ *   window blur 都会终止当前笔画，不会出现"未按下也在刮"；
+ * - onStrokeStart 支持返回 Promise（如需要跨标签页锁内扣次数）：
+ *   等待期间笔画点被缓冲，授权后按序补刮，拒绝则丢弃缓冲且不产生任何擦除。
  */
 
 const NOISE_SIZE = 128
@@ -42,6 +44,8 @@ export function createScratchLayer({
   let destroyed = false
   let activePointerId = null
   let lastPoint = null
+  let pendingPointerId = null
+  let pendingPoints = []
 
   paintCoating()
 
@@ -137,10 +141,57 @@ export function createScratchLayer({
   }
 
   function handlePointerDown(e) {
-    if (!enabled || activePointerId !== null || destroyed) return
+    if (!enabled || activePointerId !== null || pendingPointerId !== null || destroyed) return
     if (e.pointerType === 'mouse' && e.button !== 0) return
-    // 询问外部是否允许开始（如次数已用完则拒绝，涂层不可刮）
-    if (onStrokeStart() === false) return
+    // 询问外部是否允许开始（如次数已用完则拒绝，涂层不可刮）；
+    // 返回值可以是 Promise：等待期间缓冲笔画，授权后补刮
+    let decision
+    try {
+      decision = onStrokeStart()
+    } catch {
+      decision = false
+    }
+    if (decision && typeof decision.then === 'function') {
+      pendingPointerId = e.pointerId
+      pendingPoints = []
+      const point = toLogical(e)
+      if (point) pendingPoints.push(point)
+      decision.then(
+        (allowed) => {
+          if (pendingPointerId !== e.pointerId) return
+          pendingPointerId = null
+          if (allowed === false || !enabled || destroyed) {
+            pendingPoints = []
+            return
+          }
+          const buffered = pendingPoints
+          pendingPoints = []
+          activePointerId = e.pointerId
+          try {
+            canvas.setPointerCapture(e.pointerId)
+          } catch {
+            // 某些环境不支持捕获，退化为普通监听
+          }
+          let prev = buffered[0] || null
+          lastPoint = prev
+          for (const p of buffered) {
+            if (!prev) continue
+            eraseSegment(prev, p)
+            onSegment(prev.x, prev.y, p.x, p.y)
+            prev = p
+          }
+          if (prev) render()
+        },
+        () => {
+          if (pendingPointerId === e.pointerId) {
+            pendingPointerId = null
+            pendingPoints = []
+          }
+        },
+      )
+      return
+    }
+    if (decision === false) return
     e.preventDefault()
     try {
       canvas.setPointerCapture(e.pointerId)
@@ -158,6 +209,11 @@ export function createScratchLayer({
   }
 
   function handlePointerMove(e) {
+    if (pendingPointerId !== null && e.pointerId === pendingPointerId) {
+      const point = toLogical(e)
+      if (point) pendingPoints.push(point)
+      return
+    }
     if (activePointerId === null || e.pointerId !== activePointerId) return
     // 合并事件补全快速划动期间的中间点，防止刮痕断裂
     const events =
@@ -175,6 +231,12 @@ export function createScratchLayer({
   }
 
   function endStroke(e) {
+    if (pendingPointerId !== null) {
+      if (e && e.pointerId !== undefined && e.pointerId !== pendingPointerId) return
+      pendingPointerId = null
+      pendingPoints = []
+      return
+    }
     if (activePointerId === null) return
     if (e && e.pointerId !== undefined && e.pointerId !== activePointerId) return
     activePointerId = null

@@ -127,6 +127,80 @@ button {
 
 /* ---------- 卡片列表 ---------- */
 
+/* ---------- 多活动分区 ---------- */
+
+.campaign {
+  padding: 28px 20px 8px;
+  border-bottom: 1px solid var(--border);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.campaign-head {
+  text-align: center;
+
+  h2 {
+    color: var(--campaign-accent, var(--accent));
+  }
+}
+
+.campaign-sub {
+  font-size: 14px;
+  margin: 2px 0 12px;
+}
+
+/* 两个活动视觉可区分：周末卡使用暖橙强调色（沿用同一套变量结构） */
+.campaign[data-theme='weekend'] {
+  --campaign-accent: #f0772c;
+  --campaign-accent-bg: rgba(240, 119, 44, 0.12);
+  --campaign-accent-border: rgba(240, 119, 44, 0.5);
+}
+
+@media (prefers-color-scheme: dark) {
+  .campaign[data-theme='weekend'] {
+    --campaign-accent: #fb923c;
+    --campaign-accent-bg: rgba(251, 146, 60, 0.16);
+    --campaign-accent-border: rgba(251, 146, 60, 0.5);
+  }
+}
+
+.campaign .chances,
+.campaign .card-status,
+.campaign .reveal-btn {
+  color: var(--campaign-accent, var(--accent));
+  background: var(--campaign-accent-bg, var(--accent-bg));
+}
+
+.campaign .card-status {
+  border: 1px solid var(--campaign-accent-border, var(--accent-border));
+}
+
+.campaign .reveal-btn:hover {
+  border-color: var(--campaign-accent-border, var(--accent-border));
+}
+
+.campaign .reveal-btn:focus-visible {
+  outline-color: var(--campaign-accent, var(--accent));
+}
+
+.campaign .prize-layer {
+  background:
+    radial-gradient(circle at 50% 30%, var(--campaign-accent-bg, var(--accent-bg)), transparent 70%),
+    var(--code-bg);
+}
+
+.campaign .prize-result.is-win {
+  color: var(--campaign-accent, var(--accent));
+}
+
+.time-anomaly {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--campaign-accent, #d97706);
+}
+
 .cards {
   flex-grow: 1;
   display: flex;
@@ -135,6 +209,11 @@ button {
   align-content: flex-start;
   gap: 28px;
   padding: 32px 20px 64px;
+}
+
+.campaign .cards {
+  flex-grow: 0;
+  padding: 24px 0 40px;
 }
 
 .scratch-card {
@@ -255,6 +334,56 @@ button {
 
   p {
     margin-bottom: 20px;
+  }
+}
+
+.verify-toggle {
+  display: block;
+  margin: 0 auto 12px;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  color: var(--text-h);
+  background: var(--social-bg);
+  border: 1px solid var(--border);
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+}
+
+.verify-panel {
+  text-align: left;
+  font-size: 13px;
+  font-family: var(--mono);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 18px;
+
+  dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 14px;
+  }
+
+  dt {
+    color: var(--text);
+  }
+
+  dd {
+    margin: 0;
+    color: var(--text-h);
+    word-break: break-all;
+  }
+
+  .verify-note {
+    margin: 8px 0 0;
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--text);
   }
 }
 

@@ -320,3 +320,143 @@ button {
     transform: translate(-50%, 0);
   }
 }
+
+/* ---------- 多活动区块 ---------- */
+
+.campaign-block {
+  --campaign-accent: var(--accent);
+  --campaign-accent-bg: var(--accent-bg);
+  --campaign-accent-border: var(--accent-border);
+
+  border-top: 1px solid var(--border);
+  padding: 28px 20px 8px;
+
+  &.tone-weekend {
+    --campaign-accent: #e8623d;
+    --campaign-accent-bg: rgba(232, 98, 61, 0.1);
+    --campaign-accent-border: rgba(232, 98, 61, 0.5);
+  }
+
+  .campaign-head {
+    text-align: center;
+    margin-bottom: 8px;
+
+    h2 {
+      display: inline-block;
+      padding: 2px 14px;
+      border-radius: 999px;
+      color: var(--campaign-accent);
+      background: var(--campaign-accent-bg);
+      border: 1px solid var(--campaign-accent-border);
+    }
+
+    .campaign-sub {
+      margin-top: 10px;
+      font-size: 15px;
+    }
+
+    .chances {
+      display: inline-flex;
+      margin-top: 12px;
+      font-family: var(--mono);
+      font-size: 15px;
+      padding: 5px 12px;
+      border-radius: 5px;
+      color: var(--campaign-accent);
+      background: var(--campaign-accent-bg);
+      border: 2px solid transparent;
+
+      &.is-empty {
+        color: var(--text);
+        background: var(--social-bg);
+      }
+    }
+
+    .time-warn {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--campaign-accent);
+    }
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .campaign-block.tone-weekend {
+    --campaign-accent: #fb8c66;
+    --campaign-accent-bg: rgba(251, 140, 102, 0.15);
+    --campaign-accent-border: rgba(251, 140, 102, 0.5);
+  }
+}
+
+/* 活动区块内的卡片使用各自的主题色 */
+.campaign-block {
+  .prize-layer {
+    background:
+      radial-gradient(circle at 50% 30%, var(--campaign-accent-bg), transparent 70%),
+      var(--code-bg);
+
+    .prize-result.is-win {
+      color: var(--campaign-accent);
+    }
+  }
+
+  .card-status {
+    color: var(--campaign-accent);
+    background: var(--campaign-accent-bg);
+    border-color: var(--campaign-accent-border);
+  }
+
+  .reveal-btn {
+    color: var(--campaign-accent);
+    background: var(--campaign-accent-bg);
+
+    &:hover {
+      border-color: var(--campaign-accent-border);
+    }
+    &:focus-visible {
+      outline-color: var(--campaign-accent);
+    }
+  }
+}
+
+/* ---------- 公平性验证面板 ---------- */
+
+.fairness {
+  margin: -8px 0 16px;
+
+  .btn-link {
+    padding: 0;
+    border: none;
+    background: none;
+    font-size: 13px;
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .fairness-panel {
+    margin: 12px 0 0;
+    padding: 12px 14px;
+    border-radius: 8px;
+    text-align: left;
+    font-size: 13px;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+
+    dt {
+      color: var(--text);
+      margin-top: 8px;
+
+      &:first-child {
+        margin-top: 0;
+      }
+    }
+
+    dd {
+      margin: 2px 0 0;
+      font-family: var(--mono);
+      color: var(--text-h);
+      word-break: break-all;
+    }
+  }
+}

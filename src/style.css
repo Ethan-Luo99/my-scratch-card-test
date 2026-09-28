@@ -123,6 +123,17 @@ button {
     color: var(--text);
     opacity: 0.8;
   }
+
+  .offline-banner {
+    margin-top: 10px;
+    display: inline-block;
+    font-size: 13px;
+    padding: 6px 14px;
+    border-radius: 6px;
+    color: var(--accent);
+    background: var(--accent-bg);
+    border: 1px solid var(--accent-border);
+  }
 }
 
 /* ---------- 卡片列表 ---------- */
@@ -173,7 +184,31 @@ button {
   background: var(--campaign-accent-bg, var(--accent-bg));
 }
 
-.campaign .card-status {
+.campaign /* 离线/锁定提示（卡面内，覆盖在涂层下方区域之上） */
+.card-lock-hint {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  margin: 0;
+  font-size: 12px;
+  text-align: center;
+  color: var(--text);
+  background: var(--social-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  pointer-events: none;
+}
+
+.card-action-hint {
+  margin: 0;
+  font-size: 13px;
+  text-align: center;
+  color: var(--text);
+}
+
+.card-status {
   border: 1px solid var(--campaign-accent-border, var(--accent-border));
 }
 
@@ -272,6 +307,30 @@ button {
   cursor: crosshair;
   user-select: none;
   -webkit-user-select: none;
+}
+
+/* 离线/锁定提示（卡面内，覆盖在涂层下方区域之上） */
+.card-lock-hint {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  margin: 0;
+  font-size: 12px;
+  text-align: center;
+  color: var(--text);
+  background: var(--social-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  pointer-events: none;
+}
+
+.card-action-hint {
+  margin: 0;
+  font-size: 13px;
+  text-align: center;
+  color: var(--text);
 }
 
 .card-status {
@@ -421,6 +480,12 @@ button {
       border-color: var(--border);
     }
   }
+}
+
+/* ---------- 迁移向导 ---------- */
+
+.migration-backdrop {
+  z-index: 30;
 }
 
 /* ---------- 提示条 ---------- */

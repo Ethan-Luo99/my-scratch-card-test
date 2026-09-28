@@ -50,9 +50,11 @@ test('F31 前后端隔离：src 不引用 server；server 不引用 src；服务
   for (const file of walk(srcDir)) {
     const source = readFileSync(file, 'utf8')
     for (const match of source.matchAll(importPattern)) {
-      assert.ok(!/(^|\/)server\//.test(match[1]), `${file} 不得 import 服务端模块`)
+      const specifier = match[1]
+      assert.ok(!/(^|\/)server\//.test(specifier), `${file} 不得 import 服务端模块`)
+      assert.ok(!specifier.includes('../server'), `${file} 不得通过相对路径引用 server/`)
     }
-    assert.ok(!source.includes('/api/'), '本轮前端不接 API（src/ 保持不动）')
+    assert.ok(!/node:crypto/.test(source), '前端不得直接依赖 node:crypto')
   }
   for (const file of walk(serverDir)) {
     const source = readFileSync(file, 'utf8')
@@ -66,7 +68,7 @@ test('F32a dev：Vite configureServer 中间件下真实 HTTP 完成 begin→rev
   const vite = await createViteServer({
     root,
     logLevel: 'silent',
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, watch: null },
     configFile: join(root, 'vite.config.js'),
   })
   const httpServer = createServer(vite.middlewares)
@@ -130,7 +132,8 @@ test('F32b build：vite build 成功，且产物不含服务端代码', async ()
     const source = readFileSync(file, 'utf8')
     assert.ok(!source.includes('mulberry32-sha256-commit-v1'), '构建产物混入服务端算法常量')
     assert.ok(!source.includes('commitment-created'), '构建产物混入服务端事件')
-    assert.ok(!source.includes('/api/migrate/import'), '构建产物混入服务端路由')
     assert.ok(!source.includes('server/core'), '构建产物混入 server 模块路径')
+    assert.ok(!/node:crypto/.test(source), '构建产物混入 node: 内置模块')
+    assert.ok(!/from\s*['"][^'"]*\/server\//.test(source), '构建产物混入 server/ import')
   }
 })

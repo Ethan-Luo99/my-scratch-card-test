@@ -79,6 +79,22 @@ export function createKvBackend(storageFactory = defaultStorage) {
       }
       memory.delete(key)
     },
+    /** 枚举全部 key（迁移扫描用）；持久化禁用时退化为内存 Map 键集 */
+    keys() {
+      if (persistent) {
+        try {
+          const out = []
+          for (let i = 0; i < backend.length; i += 1) {
+            const name = backend.key(i)
+            if (name !== null) out.push(name)
+          }
+          return out
+        } catch {
+          return [...memory.keys()]
+        }
+      }
+      return [...memory.keys()]
+    },
     /** 订阅其他标签页对同一浏览器的写入（localStorage storage 事件） */
     subscribe(fn) {
       listeners.add(fn)

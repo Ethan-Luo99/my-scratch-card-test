@@ -51,8 +51,9 @@ test('F31 前后端隔离：src 不引用 server；server 不引用 src；服务
     const source = readFileSync(file, 'utf8')
     for (const match of source.matchAll(importPattern)) {
       assert.ok(!/(^|\/)server\//.test(match[1]), `${file} 不得 import 服务端模块`)
+      assert.ok(!/^node:/.test(match[1]), `${file} 前端不得依赖 node: 内置模块`)
     }
-    assert.ok(!source.includes('/api/'), '本轮前端不接 API（src/ 保持不动）')
+    // 前端只能经同源 HTTP（fetch '/api/...'）访问服务端，不得静态引用服务端代码
   }
   for (const file of walk(serverDir)) {
     const source = readFileSync(file, 'utf8')
@@ -66,7 +67,12 @@ test('F32a dev：Vite configureServer 中间件下真实 HTTP 完成 begin→rev
   const vite = await createViteServer({
     root,
     logLevel: 'silent',
-    server: { middlewareMode: true },
+    server: {
+      middlewareMode: true,
+      // 测试只用 HTTP 中间件。在 inotify 实例受限的 CI/沙箱里，chokidar 默认
+      // fs.watch 会耗尽 inotify 实例（EMFILE）；改用轮询，不申请 inotify。
+      watch: { usePolling: true, interval: 1000, binaryInterval: 1000 },
+    },
     configFile: join(root, 'vite.config.js'),
   })
   const httpServer = createServer(vite.middlewares)
@@ -130,7 +136,8 @@ test('F32b build：vite build 成功，且产物不含服务端代码', async ()
     const source = readFileSync(file, 'utf8')
     assert.ok(!source.includes('mulberry32-sha256-commit-v1'), '构建产物混入服务端算法常量')
     assert.ok(!source.includes('commitment-created'), '构建产物混入服务端事件')
-    assert.ok(!source.includes('/api/migrate/import'), '构建产物混入服务端路由')
     assert.ok(!source.includes('server/core'), '构建产物混入 server 模块路径')
+    assert.ok(!source.includes('server/'), '构建产物不得出现 server/ 字样')
+    assert.ok(!source.includes('node:crypto'), '构建产物不得出现 node:crypto 字样')
   }
 })

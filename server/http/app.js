@@ -8,7 +8,7 @@
  *   已被去掉 /api 前缀，内部两种形态都能匹配。
  */
 import { createServerEngine, EngineError } from '../core/engine.js'
-import { MemoryStore } from '../store/memory.js'
+import { createStore } from '../store/factory.js'
 import { createSigner } from '../core/rng.js'
 import { createDefaultConfig } from '../core/config.js'
 
@@ -61,11 +61,12 @@ function parseCookies(req) {
 
 export function createServerApp(options = {}) {
   const clock = options.clock ?? (() => Date.now())
-  const store = options.store ?? new MemoryStore()
+  const store = options.store ?? createStore(options.storeOptions)
   const signer = options.signer ?? createSigner()
   const config = options.config ?? createDefaultConfig()
   const logger = options.logger
   const engine = options.engine ?? createServerEngine({ clock, store, signer, config, logger })
+  const isPersistent = () => Boolean(store?.isPersistent)
 
   function sendJson(res, { status = 200, body, headers }) {
     const raw = JSON.stringify(body)
@@ -99,7 +100,25 @@ export function createServerApp(options = {}) {
 
       // GET
       if (method === 'GET' && matchPath(pathname, '/healthz')) {
-        return sendJson(res, { status: 200, body: engine.health() })
+        return sendJson(res, {
+          status: 200,
+          body: { ...engine.health(), isPersistent: isPersistent() },
+        })
+      }
+      if (method === 'GET' && matchPath(pathname, '/audit/verify')) {
+        if (typeof store.verify !== 'function') {
+          // MemoryStore 无审计链：明确返回不可审计，而不是伪造 ok:true
+          return sendJson(res, {
+            status: 200,
+            body: {
+              ok: false,
+              entries: 0,
+              persistent: false,
+              anomalies: [{ kind: 'audit-unavailable', detail: 'in-memory store' }],
+            },
+          })
+        }
+        return sendJson(res, { status: 200, body: store.verify() })
       }
       if (method === 'GET' && matchPath(pathname, '/verification-key')) {
         return sendJson(res, { status: 200, body: engine.verificationKey() })
@@ -172,7 +191,10 @@ export function createServerApp(options = {}) {
 
       if (method === 'POST' && matchPath(pathname, '/recover')) {
         const result = await engine.recover(sid)
-        return sendJson(res, { status: 200, body: result })
+        return sendJson(res, {
+          status: 200,
+          body: { ...result, isPersistent: isPersistent() },
+        })
       }
 
       return sendJson(res, { status: 404, body: { error: 'not-found' } })

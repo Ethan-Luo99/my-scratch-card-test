@@ -11,6 +11,7 @@ import { createServerEngine, EngineError } from '../core/engine.js'
 import { MemoryStore } from '../store/memory.js'
 import { createSigner } from '../core/rng.js'
 import { createDefaultConfig } from '../core/config.js'
+import { createStore } from '../store/factory.js'
 
 const API_PREFIX = '/api'
 const SESSION_COOKIE = 'sid'
@@ -61,7 +62,14 @@ function parseCookies(req) {
 
 export function createServerApp(options = {}) {
   const clock = options.clock ?? (() => Date.now())
-  const store = options.store ?? new MemoryStore()
+  const created = options.store
+    ? { store: options.store, persistent: options.store.isPersistent !== false }
+    : createStore({
+        dir: options.dataDir ?? process.env.SCRATCH_PERSIST_DIR ?? null,
+        logger: options.logger,
+        fileStoreOptions: options.fileStoreOptions,
+      })
+  const store = created.store
   const signer = options.signer ?? createSigner()
   const config = options.config ?? createDefaultConfig()
   const logger = options.logger
@@ -99,10 +107,20 @@ export function createServerApp(options = {}) {
 
       // GET
       if (method === 'GET' && matchPath(pathname, '/healthz')) {
-        return sendJson(res, { status: 200, body: engine.health() })
+        return sendJson(res, {
+          status: 200,
+          body: { ...engine.health(), isPersistent: store.isPersistent !== false },
+        })
       }
       if (method === 'GET' && matchPath(pathname, '/verification-key')) {
         return sendJson(res, { status: 200, body: engine.verificationKey() })
+      }
+      if (method === 'GET' && matchPath(pathname, '/audit/verify')) {
+        const result =
+          typeof store.verifyAudit === 'function'
+            ? store.verifyAudit()
+            : { ok: true, persistent: false, entries: 0, anomalies: [] }
+        return sendJson(res, { status: 200, body: result })
       }
       if (method === 'GET' && matchPath(pathname, '/state')) {
         const campaignId = url.searchParams.get('campaign')
@@ -113,6 +131,8 @@ export function createServerApp(options = {}) {
       // POST
       if (method === 'POST' && matchPath(pathname, '/session')) {
         const { setCookieSid, body: responseBody } = engine.createSession()
+        // createSession 不经过 withSidLock（sid 尚不存在）：显式提交本事务
+        if (typeof store.flushPending === 'function') store.flushPending()
         const cookie = [
           `${SESSION_COOKIE}=${encodeURIComponent(setCookieSid)}`,
           'HttpOnly',

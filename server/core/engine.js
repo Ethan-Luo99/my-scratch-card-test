@@ -455,6 +455,7 @@ export function createServerEngine({ clock, store, signer, config, logger } = {}
       const { dayKey, anomaly } = effectiveDay(session)
       const view = fullView(session.sid, dayKey)
       view.clockAnomaly = anomaly
+      view.isPersistent = store.isPersistent !== false
       view.campaigns = view.campaigns.map((snapshot) => {
         const meta = config.getCampaign(snapshot.campaignId)
         return {

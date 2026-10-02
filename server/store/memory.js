@@ -39,6 +39,16 @@ export class MemoryStore {
     this.locks = new Map()
   }
 
+  /** 是否具备磁盘持久化（FileStore=true；内存/降级态=false，经 healthz/recover 透出） */
+  get isPersistent() {
+    return false
+  }
+
+  /** 内存模式无哈希链可校验：持久化审计为空操作且明确标记 persistent=false */
+  verifyAudit() {
+    return { ok: true, persistent: false, entries: 0, anomalies: [] }
+  }
+
   /** 按 sid 串行执行临界区（Promise 链实现的分片互斥队列） */
   async withSidLock(sid, fn) {
     const prev = this.locks.get(sid) ?? Promise.resolve()
@@ -51,8 +61,17 @@ export class MemoryStore {
     try {
       return await fn()
     } finally {
-      release()
-      if (this.locks.get(sid) === next) this.locks.delete(sid)
+      // 持久化钩子：FileStore 在临界区末尾原子落盘本事务；MemoryStore 为空操作，
+      // 引擎业务时序不变（钩子在全部读改写完成之后、锁释放之前执行一次）。
+      // 钩子即便抛错（模拟崩溃）也必须释放分片锁，避免同 sid 后续请求挂死。
+      try {
+        if (typeof this.afterCriticalSection === 'function') {
+          await this.afterCriticalSection(sid)
+        }
+      } finally {
+        release()
+        if (this.locks.get(sid) === next) this.locks.delete(sid)
+      }
     }
   }
 

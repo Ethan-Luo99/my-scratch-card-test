@@ -12,6 +12,7 @@ import { MemoryStore } from '../store/memory.js'
 import { createSigner } from '../core/rng.js'
 import { createDefaultConfig } from '../core/config.js'
 import { createStore } from '../store/factory.js'
+import { PitrNotExportableError } from '../store/file.js'
 
 const API_PREFIX = '/api'
 const SESSION_COOKIE = 'sid'
@@ -126,6 +127,29 @@ export function createServerApp(options = {}) {
             : { ok: true, persistent: false, entries: 0, anomalies: [] }
         return sendJson(res, { status: 200, body: result })
       }
+      if (method === 'GET' && matchPath(pathname, '/audit/export')) {
+        // 时间点导出：asOf 只允许落在已提交 COMMIT 边界；follower 内部先追平
+        // leader。返回单文件 JSON 备份包（FileStore.restoreFromBackup 可恢复）。
+        const rawAsOf = url.searchParams.get('asOf')
+        const asOf = Number(rawAsOf)
+        if (rawAsOf === null || !Number.isFinite(asOf)) {
+          throw new EngineError(400, 'bad-request', 'query parameter asOf=<epoch ms> is required')
+        }
+        if (typeof store.exportPitr !== 'function') {
+          throw new PitrNotExportableError(
+            'point-in-time export requires a persistent v2 store (this instance is in-memory/degraded)',
+            { reason: 'persistent-store-required' },
+          )
+        }
+        const backup = await store.exportPitr(asOf)
+        return sendJson(res, {
+          status: 200,
+          body: backup,
+          headers: {
+            'content-disposition': `attachment; filename="pitr-${backup.asOf}.backup.json"`,
+          },
+        })
+      }
       if (method === 'GET' && matchPath(pathname, '/state')) {
         const campaignId = url.searchParams.get('campaign')
         const result = await engine.state(sid, campaignId)
@@ -207,6 +231,21 @@ export function createServerApp(options = {}) {
       if (error && error.code === 'read-only') {
         // follower 实例上的写请求：明确的只读拒绝（数据目录由 leader 独占写）
         return sendJson(res, { status: 423, body: { error: 'read-only', message: error.message } })
+      }
+      if (error && error.code === 'pitr-not-exportable') {
+        // asOf 不可导出（非提交边界 / 早于磁盘起点 / follower 未追平）：明确原因
+        const { message } = error
+        return sendJson(res, {
+          status: error.status ?? 409,
+          body: {
+            error: 'pitr-not-exportable',
+            message,
+            ...(error.reason ? { reason: error.reason } : {}),
+            ...(error.earliestCommitAt != null ? { earliestCommitAt: error.earliestCommitAt } : {}),
+            ...(error.latestCommitAt != null ? { latestCommitAt: error.latestCommitAt } : {}),
+            ...(error.requestedAsOf != null ? { requestedAsOf: error.requestedAsOf } : {}),
+          },
+        })
       }
       if (logger) logger({ level: 'error', event: 'unhandled', message: String(error?.message ?? error) })
       return sendJson(res, { status: 500, body: { error: 'internal-error' } })

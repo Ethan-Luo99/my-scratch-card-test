@@ -42,7 +42,7 @@
  *   mixed-format-log / snapshot-log-format-mismatch 且 ok=false）。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { openSync, writeFileSync, writeSync, renameSync, fsyncSync, closeSync, readFileSync, mkdirSync, ftruncateSync, rmSync, existsSync, statSync } from 'node:fs'
+import { openSync, writeFileSync, writeSync, renameSync, fsyncSync, closeSync, readFileSync, mkdirSync, ftruncateSync, rmSync, existsSync, statSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { MemoryStore, IDEMPOTENCY_TTL_MS } from './memory.js'
 
@@ -57,6 +57,7 @@ const TMP_V2_LOG = '.events.log.v2.tmp'
 const TMP_V2_SNAPSHOT = '.snapshot.json.v2.tmp'
 const SNAPSHOT_FORMAT_V1 = 'scratch-snapshot-v1'
 const SNAPSHOT_FORMAT_V2 = 'scratch-snapshot-v2'
+const PITR_BACKUP_FORMAT = 'scratch-pitr-backup-v1'
 const SNAPSHOT_FORMATS = new Map([
   [SNAPSHOT_FORMAT_V1, 1],
   [SNAPSHOT_FORMAT_V2, 2],
@@ -72,6 +73,24 @@ export class ReadOnlyStoreError extends Error {
   constructor() {
     super('store is read-only follower: writes require the leader')
     this.code = 'read-only'
+  }
+}
+
+/** 时间点导出无法满足：asOf 不落已提交边界 / 早于磁盘数据起点 / 链不可读 */
+export class PitrNotExportableError extends Error {
+  constructor(message, extra = {}) {
+    super(message)
+    this.code = 'pitr-not-exportable'
+    this.status = 409
+    Object.assign(this, extra)
+  }
+}
+
+/** 备份包恢复失败：包损坏/校验不过/目标目录非空 */
+export class PitrRestoreError extends Error {
+  constructor(message) {
+    super(message)
+    this.code = 'pitr-restore-failed'
   }
 }
 
@@ -294,6 +313,31 @@ function applyOps(state, ops) {
 }
 
 /**
+ * 一个事务组的提交时刻（ms）：组内所有实体变更都发生在同一临界区、同一 nowMs。
+ * 新链 COMMIT 行直接携带 at；旧链（at 缺失）由组内实体记录的时间戳确定性推导，
+ * 推导结果与写出时的 clock 取值一致，使 asOf 边界在新旧链上都可定位。
+ */
+function commitAtOf(rec, ops) {
+  if (typeof rec?.data?.at === 'number') return rec.data.at
+  for (const op of ops ?? []) {
+    const candidate =
+      op.t === 'session-upsert'
+        ? op.session?.lastSeenAt
+        : op.t === 'day-upsert'
+          ? op.record?.updatedAt
+          : op.t === 'card-upsert'
+            ? op.record?.updatedAt
+            : op.t === 'idem-upsert'
+              ? op.entry?.at
+              : op.t === 'event'
+                ? op.event?.at
+                : null
+    if (typeof candidate === 'number') return candidate
+  }
+  return null
+}
+
+/**
  * 从磁盘独立扫描快照 + 日志，重建哈希链与内存态（verifyAudit 与启动恢复共用）。
  * 不触碰任何活 store 的内存。链游标只在整条事务组（到 COMMIT）校验通过后推进，
  * 因此未提交的尾部 APPLY 整组作废、不影响"最后有效位置"。
@@ -333,6 +377,7 @@ function replayFromDisk(dir) {
   let offset = 0
   let logVersion = null // 日志内全部记录必须同版本；混杂即 mixed-format-log
   const migrations = [] // 链上 MIGRATE 记录（格式迁移事件，可审计）
+  const commits = [] // 每个已提交事务组的边界信息（PITR asOf 只能落在这些点上）
 
   // 当前进行中的事务组：ops + 组开始前的链游标/字节位置
   let groupOps = null
@@ -456,6 +501,15 @@ function replayFromDisk(dir) {
       prevHash = rec.hash
       validBytes = nextOffset
       lastLineEndedWithNewline = hasNewline
+      commits.push({
+        group,
+        at: commitAtOf(rec, groupOps.ops),
+        seq: rec.seq,
+        hash: rec.hash,
+        entries,
+        validBytes: nextOffset,
+        ops: groupOps.ops.map((op) => clone(op)),
+      })
       groupOps = null
       offset = nextOffset
       continue
@@ -550,6 +604,7 @@ function replayFromDisk(dir) {
     logVersion,
     snapshotVersion,
     migrations,
+    commits,
   }
 }
 export class FileStore extends MemoryStore {
@@ -1148,7 +1203,9 @@ export class FileStore extends MemoryStore {
       prevHash: prev,
       hash: null,
       epoch: this.epoch,
-      data: { group, n: ops.length },
+      // at = 事务提交时刻：PITR 的 asOf 只能落在这些 COMMIT 边界上；
+      // 参与哈希，旧链无 at 时由组内实体时间戳同算法推导（见 commitAtOf）。
+      data: { group, n: ops.length, at: commitAtOf(null, ops) },
     }
     if (this.formatVersion >= 2) commitRec.v = this.formatVersion
     commitRec.hash = hashRecord(commitRec)
@@ -1451,6 +1508,113 @@ export class FileStore extends MemoryStore {
   verifyAudit(nowMs = Date.now()) {
     // follower 先跟上 leader 最新提交再校验（不重启观察新提交的审计语义）
     if (this.role === 'follower') this.refresh()
+    return this._verifyAuditBody(nowMs)
+  }
+
+  // ---------- 时间点导出 / 恢复（PITR） ----------
+  /**
+   * 导出 asOfMs 时刻的可移植备份包（单 JSON）。
+   * - asOf 只解析到磁盘上的已提交 COMMIT 边界：取 at <= asOfMs 的最后一个
+   *   COMMIT（同事务内所有变更同刻发生），任何时刻导出都不可能含半事务；
+   * - 全程只读磁盘快照/日志，不与 leader 写临界区竞争，leader 写入不中断；
+   * - asOf 早于磁盘数据起点（已被快照压缩截断，或锚点之前是 v1 时代）时
+   *   抛 PitrNotExportableError，明确原因，绝不猜测；
+   * - follower 先追平 leader（链尖稳定在一个完整 COMMIT）再导出。
+   */
+  async exportPitr(asOfMs, { timeoutMs = 5000, stableRounds = 2 } = {}) {
+    if (!Number.isFinite(asOfMs)) {
+      throw new PitrNotExportableError('asOf must be a finite epoch milliseconds number', { status: 400 })
+    }
+    let disk
+    if (this.role === 'follower') {
+      disk = await this._followerCatchUpForExport({ timeoutMs, stableRounds })
+    } else {
+      disk = replayFromDisk(this.dir)
+      if (disk.truncated || disk.formatConflict || disk.anomalies.length > 0) {
+        throw new PitrNotExportableError('audit chain is not currently exportable', {
+          anomalies: disk.anomalies,
+        })
+      }
+    }
+    return buildPitrBackup(disk, this.dir, asOfMs)
+  }
+
+  /**
+   * follower 导出前追平 leader：轮询到链尖连续 stableRounds 轮不再前进，
+   * 且链尖恰好停在完整 COMMIT 边界（无未提交尾组/无异常）才返回扫描结果。
+   * 超时仍未追到稳定点则明确报错（绝不导出撕裂或落后状态）。
+   */
+  async _followerCatchUpForExport({ timeoutMs, stableRounds }) {
+    const delayMs = Math.min(250, Math.max(10, this.followerPollMs))
+    const deadline = Date.now() + timeoutMs
+    let stable = 0
+    let lastTip = null
+    for (;;) {
+      this.refresh()
+      let disk
+      try {
+        disk = replayFromDisk(this.dir)
+      } catch (error) {
+        throw new PitrNotExportableError(`follower cannot read leader chain: ${error.message}`)
+      }
+      const clean =
+        !disk.truncated &&
+        !disk.formatConflict &&
+        disk.anomalies.length === 0 &&
+        disk.commits.length > 0 &&
+        disk.validBytes === disk.logSize
+      if (clean && disk.tipHash === lastTip) {
+        stable += 1
+        if (stable >= stableRounds) return disk
+      } else if (clean) {
+        stable = 1
+        lastTip = disk.tipHash
+      } else {
+        stable = 0
+        lastTip = null
+      }
+      if (Date.now() >= deadline) {
+        throw new PitrNotExportableError(
+          'follower could not catch up with the leader before the export deadline',
+          { caughtUp: false },
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
+    }
+  }
+
+  /**
+   * 用 exportPitr 产出的备份包在（空）新数据目录恢复出自洽 v2 链，
+   * 并返回以 leader 身份打开的 FileStore。包内快照/日志逐条校验哈希后落盘，
+   * 随后走与正常启动完全相同的 _recover，verify 口径与常规实例一致。
+   */
+  static restoreFromBackup(backup, targetDir, options = {}) {
+    const validated = validatePitrBackup(backup)
+    mkdirSync(targetDir, { recursive: true })
+    const entries = readdirSafe(targetDir)
+    if (entries.length > 0) {
+      throw new PitrRestoreError(`restore target directory is not empty: ${targetDir}`)
+    }
+    try {
+      if (validated.snapshotFile) {
+        writeFileSync(join(targetDir, SNAPSHOT_FILE), validated.snapshotFile)
+        fsyncFile(join(targetDir, SNAPSHOT_FILE))
+      }
+      writeFileSync(join(targetDir, LOG_FILE), validated.logFile)
+      fsyncFile(join(targetDir, LOG_FILE))
+      fsyncDir(targetDir)
+    } catch (error) {
+      throw new PitrRestoreError(`failed to write restored files: ${error.message}`)
+    }
+    return new FileStore(targetDir, {
+      role: 'leader',
+      snapshotEveryLines: options.snapshotEveryLines ?? DEFAULT_SNAPSHOT_EVERY_LINES,
+      snapshotEveryBytes: options.snapshotEveryBytes ?? DEFAULT_SNAPSHOT_EVERY_BYTES,
+      ...(options.logger ? { logger: options.logger } : {}),
+    })
+  }
+
+  _verifyAuditBody(nowMs = Date.now()) {
     if (!this.persistent) {
       // 降级态：磁盘不再追加，无法持续审计；明确透出而非伪装 ok
       return {
@@ -1509,6 +1673,8 @@ export class FileStore extends MemoryStore {
       anomalies,
       format: disk.logVersion ?? disk.snapshotVersion ?? this.diskVersion ?? this.formatVersion,
       migrations: disk.migrations,
+      tipHash: disk.tipHash,
+      epoch: disk.epoch,
     }
   }
 }
@@ -1527,5 +1693,238 @@ function dumpOf(state, nowMs) {
     claimsLedger: [...state.claimsLedger],
     meta: Object.fromEntries(state.meta),
     events: state.events,
+  }
+}
+
+function readdirSafe(dir) {
+  try {
+    return readdirSync(dir)
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw error
+  }
+}
+
+/**
+ * 由 replayFromDisk 的扫描结果构造 asOf 备份包。
+ * 备份产物 = 当前快照文件原文（状态锚点之前的链由其 genesis 锚定）+
+ * 截至目标 COMMIT 的日志字节前缀；恢复后链尖哈希/记录数与原链该点完全一致。
+ */
+function buildPitrBackup(disk, dir, requestedAsOfMs) {
+  const boundaries = disk.commits.filter((commit) => typeof commit.at === 'number')
+  const migratedFromV1 = disk.migrations.some((migration) => migration.from === 1 && migration.to === 2)
+  if (boundaries.length === 0) {
+    if (migratedFromV1) {
+      // v1 已在线迁移：v1 时代的业务提交封装在迁移快照里、不在可导出的
+      // v2 日志链上；在 v2 首笔业务提交之前任何 asOf 都属于 v1 时代。
+      throw new PitrNotExportableError(
+        `asOf ${requestedAsOfMs} predates the v2 chain, whose earliest reachable history is the v1→v2 ` +
+          'migration anchor; v1-era point-in-time state is not exportable',
+        { reason: 'before-v1-era-boundary', earliestCommitAt: null, requestedAsOf: requestedAsOfMs },
+      )
+    }
+    throw new PitrNotExportableError(
+      'no committed transaction exists on the current disk chain; the first commit is not available yet',
+      { reason: 'no-commit-on-disk', earliestCommitAt: null, requestedAsOf: requestedAsOfMs },
+    )
+  }
+  const earliest = boundaries[0]
+  const latest = boundaries[boundaries.length - 1]
+  if (requestedAsOfMs < earliest.at) {
+    // 当前磁盘上最早的已提交事务之前的历史已不在本链：当前磁盘数据起点
+    // 之前的状态无从重建（可能已被快照压缩截断；v1 迁移目录则是 v1 时代）。
+    throw new PitrNotExportableError(
+      `asOf ${requestedAsOfMs} is earlier than the earliest committed transaction on disk (${earliest.at}); ` +
+        `history older than the current disk origin is ${migratedFromV1 ? 'v1-era and not reachable from the v2 chain' : 'not present on this chain (snapshot-compacted or pre-origin)'} and cannot be exported`,
+      {
+        reason: migratedFromV1 ? 'before-v1-era-boundary' : 'before-disk-origin',
+        earliestCommitAt: earliest.at,
+        latestCommitAt: latest.at,
+        requestedAsOf: requestedAsOfMs,
+      },
+    )
+  }
+  // floor 到 at <= asOf 的最后一个 COMMIT：asOf 永远只落在提交边界，
+  // 绝不会导出事务进行中的半状态；asOf >= 最新提交即取链尖。
+  let target = boundaries[0]
+  for (const commit of boundaries) {
+    if (commit.at <= requestedAsOfMs) target = commit
+  }
+
+  // 独立重放到目标边界（不依赖可能已经走到链尖的 disk.state）
+  const state = disk.snapshot ? stateFromSnapshot(disk.snapshot) : freshState()
+  for (const commit of disk.commits) {
+    applyOps(state, commit.ops)
+    if (commit === target) break
+  }
+
+  const logBuffer = readFileSync(join(dir, LOG_FILE))
+  const logPrefix = logBuffer.subarray(0, target.validBytes).toString('utf8')
+  let snapshotFile = null
+  let snapshotMeta = null
+  if (disk.snapshot) {
+    snapshotFile = readFileSync(join(dir, SNAPSHOT_FILE), 'utf8')
+    snapshotMeta = {
+      format: disk.snapshot.format,
+      epoch: disk.snapshot.epoch,
+      snapshotId: disk.snapshot.snapshotId,
+      tipHash: disk.snapshot.tipHash,
+      records: disk.snapshot.records,
+      genesisHash: disk.snapshot.genesisHash,
+    }
+  }
+
+  // TTL 取舍：asOf 时刻已过期的幂等键按过期语义不参与有效状态；
+  // 链上记录原样保留（历史不可改写），仅在回复中说明，verify 按同一 TTL
+  // 口径比较，恢复实例不会产生 TTL 伪分叉。
+  const ttlBaseMs = target.at
+  const expiredIdempotencyKeys = []
+  for (const [key, entry] of state.idempotency) {
+    if (ttlBaseMs - entry.at > IDEMPOTENCY_TTL_MS) expiredIdempotencyKeys.push(key)
+  }
+  expiredIdempotencyKeys.sort()
+
+  const backup = {
+    format: PITR_BACKUP_FORMAT,
+    version: 1,
+    exportedAt: Date.now(),
+    asOf: target.at,
+    requestedAsOf: requestedAsOfMs,
+    epoch: disk.epoch,
+    snapshot: snapshotMeta,
+    snapshotFile,
+    logLines: logPrefix,
+    target: {
+      group: target.group,
+      commitSeq: target.seq,
+      tipHash: target.hash,
+      entries: target.entries,
+    },
+    idempotencyTtlMs: IDEMPOTENCY_TTL_MS,
+    idempotency: {
+      policy: 'keys expired at asOf are excluded from effective state by TTL; chain records stay intact',
+      expiredAtAsOf: expiredIdempotencyKeys.length,
+      expiredKeys: expiredIdempotencyKeys,
+    },
+  }
+  backup.checksum = sha256Hex(pitrChecksumPayload(backup))
+  return backup
+}
+
+/** 校验和只覆盖重建所需载荷（checksum 字段自身除外），canonical 保证跨进程稳定 */
+function pitrChecksumPayload(backup) {
+  const { checksum, ...payload } = backup
+  void checksum
+  return canonicalJSON(payload)
+}
+
+/**
+ * 解析并逐条验证备份包：整体 checksum → 快照 checksum/锚点 → 日志每一行
+ * checksum/哈希链/序号，并确认日志链尖恰为备份声明的目标 COMMIT。
+ * 返回可直接原样落盘的 snapshotFile/logFile 与对账元数据。
+ */
+function validatePitrBackup(backup) {
+  if (!backup || typeof backup !== 'object') {
+    throw new PitrRestoreError('backup is not an object')
+  }
+  if (backup.format !== PITR_BACKUP_FORMAT || backup.version !== 1) {
+    throw new PitrRestoreError(`unsupported backup format: ${backup.format} v${backup.version}`)
+  }
+  const declaredChecksum = backup.checksum
+  if (typeof declaredChecksum !== 'string' || sha256Hex(pitrChecksumPayload(backup)) !== declaredChecksum) {
+    throw new PitrRestoreError('backup checksum mismatch: package tampered or corrupted')
+  }
+  if (typeof backup.logLines !== 'string' || backup.logLines.length === 0) {
+    throw new PitrRestoreError('backup log segment is empty')
+  }
+  if (!backup.target || typeof backup.target.tipHash !== 'string' || typeof backup.target.entries !== 'number') {
+    throw new PitrRestoreError('backup target anchor is missing')
+  }
+
+  let snapshot = null
+  let snapshotFile = null
+  if (backup.snapshotFile != null) {
+    if (typeof backup.snapshotFile !== 'string') {
+      throw new PitrRestoreError('backup snapshot payload has wrong type')
+    }
+    const trimmed = backup.snapshotFile.replace(/\s+$/, '')
+    const splitAt = trimmed.lastIndexOf('\n')
+    if (splitAt <= 0) throw new PitrRestoreError('backup snapshot missing checksum line')
+    const snapshotChecksum = trimmed.slice(splitAt + 1)
+    const jsonPart = trimmed.slice(0, splitAt)
+    let parsed
+    try {
+      parsed = JSON.parse(jsonPart)
+    } catch {
+      throw new PitrRestoreError('backup snapshot is not JSON')
+    }
+    if (
+      !parsed ||
+      parsed.format !== SNAPSHOT_FORMAT_V2 ||
+      !/^[0-9a-f]{64}$/.test(snapshotChecksum) ||
+      sha256Hex(canonicalJSON(parsed)) !== snapshotChecksum
+    ) {
+      throw new PitrRestoreError('backup snapshot checksum/shape mismatch')
+    }
+    snapshot = parsed
+    snapshotFile = backup.snapshotFile.endsWith('\n') ? backup.snapshotFile : `${backup.snapshotFile}\n`
+  }
+
+  const lines = backup.logLines.split('\n').filter((line) => line.length > 0)
+  let expectedSeq = 1
+  let prevHash = snapshot ? snapshot.genesisHash : ZERO_HASH
+  let epoch = snapshot ? snapshot.epoch : 0
+  let entries = snapshot ? snapshot.records : 0
+  let lastCommit = null
+  let sawGenesis = false
+  for (const rawLine of lines) {
+    let rec
+    try {
+      rec = decodeLine(rawLine)
+    } catch (error) {
+      throw new PitrRestoreError(`backup log record invalid: ${error.message}`)
+    }
+    if (rec.kind === 'GENESIS') {
+      if (sawGenesis || rec.seq !== 1 || rec.prevHash !== ZERO_HASH || rec.epoch !== epoch) {
+        throw new PitrRestoreError('backup log genesis is malformed')
+      }
+      if (snapshot) {
+        if (
+          rec.data.snapshotId !== snapshot.snapshotId ||
+          rec.data.prevEpochTip !== snapshot.tipHash ||
+          rec.data.prevEpochRecords !== snapshot.records
+        ) {
+          throw new PitrRestoreError('backup genesis does not anchor to its snapshot')
+        }
+      } else if (rec.data.epoch !== 0 || rec.data.snapshotId !== undefined) {
+        throw new PitrRestoreError('backup primal genesis must be the fixed genesis')
+      }
+      sawGenesis = true
+      entries += 1
+      prevHash = rec.hash
+      expectedSeq = 2
+      continue
+    }
+    if (rec.seq !== expectedSeq || rec.prevHash !== prevHash || rec.epoch !== epoch) {
+      throw new PitrRestoreError('backup log hash chain is broken')
+    }
+    entries += 1
+    expectedSeq = rec.seq + 1
+    prevHash = rec.hash
+    if (rec.kind === 'COMMIT') lastCommit = { hash: rec.hash, entries }
+  }
+  if (!sawGenesis || !lastCommit) {
+    throw new PitrRestoreError('backup log segment lacks genesis or a final COMMIT')
+  }
+  if (lastCommit.hash !== backup.target.tipHash || lastCommit.entries !== backup.target.entries) {
+    throw new PitrRestoreError('backup log tip does not match the declared target anchor')
+  }
+  return {
+    snapshot,
+    snapshotFile,
+    logFile: backup.logLines.endsWith('\n') ? backup.logLines : `${backup.logLines}\n`,
+    tipHash: lastCommit.hash,
+    entries: lastCommit.entries,
+    asOf: backup.asOf,
   }
 }

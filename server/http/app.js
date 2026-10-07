@@ -70,6 +70,7 @@ export function createServerApp(options = {}) {
         fileStoreOptions: options.fileStoreOptions,
       })
   const store = created.store
+  if (created.restoreError) throw created.restoreError
   const signer = options.signer ?? createSigner()
   const config = options.config ?? createDefaultConfig()
   const logger = options.logger
@@ -125,6 +126,24 @@ export function createServerApp(options = {}) {
             ? store.verifyAudit()
             : { ok: true, persistent: false, entries: 0, anomalies: [] }
         return sendJson(res, { status: 200, body: result })
+      }
+      if (method === 'GET' && matchPath(pathname, '/audit/export')) {
+        const rawAsOf = url.searchParams.get('asOf')
+        const asOf = Number(rawAsOf)
+        if (rawAsOf === null || !Number.isFinite(asOf)) {
+          throw new EngineError(400, 'pitr-invalid-as-of', 'asOf must be a millisecond timestamp')
+        }
+        if (typeof store.exportAt !== 'function') {
+          throw new EngineError(409, 'pitr-persistence-unavailable', 'point-in-time export requires FileStore persistence')
+        }
+        const backup = await store.exportAt(asOf)
+        return sendJson(res, {
+          status: 200,
+          body: backup,
+          headers: {
+            'content-disposition': `attachment; filename="scratch-pitr-${asOf}.json"`,
+          },
+        })
       }
       if (method === 'GET' && matchPath(pathname, '/state')) {
         const campaignId = url.searchParams.get('campaign')
@@ -203,6 +222,12 @@ export function createServerApp(options = {}) {
     } catch (error) {
       if (error instanceof EngineError) {
         return sendJson(res, { status: error.status, body: { error: error.error, message: error.message } })
+      }
+      if (error?.code?.startsWith?.('pitr-')) {
+        return sendJson(res, {
+          status: error.status ?? 422,
+          body: { error: error.code, message: error.message },
+        })
       }
       if (error && error.code === 'read-only') {
         // follower 实例上的写请求：明确的只读拒绝（数据目录由 leader 独占写）

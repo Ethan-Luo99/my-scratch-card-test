@@ -16,14 +16,19 @@ export function createStore(options = {}) {
   if (options.store) return { store: options.store, persistent: options.store.isPersistent !== false }
   const dir = options.dir ?? process.env.SCRATCH_PERSIST_DIR ?? DEFAULT_DATA_DIR
   if (!dir) return { store: new MemoryStore(), persistent: false }
+  const restorePackagePath = options.restorePackagePath ?? process.env.SCRATCH_RESTORE_PACKAGE ?? null
   try {
-    const store = new FileStore(dir, options.fileStoreOptions)
+    const fileStoreOptions = restorePackagePath
+      ? { ...options.fileStoreOptions, restorePackage: restorePackagePath }
+      : options.fileStoreOptions
+    const store = new FileStore(dir, fileStoreOptions)
     return {
       store,
       persistent: store.isPersistent,
       degradedReason: store.degradedReason ?? null,
     }
   } catch (error) {
+    if (restorePackagePath && error?.code?.startsWith?.('pitr-')) throw error
     if (options.logger) {
       options.logger({ level: 'warn', event: 'store-factory-fallback', error: String(error?.message ?? error) })
     }

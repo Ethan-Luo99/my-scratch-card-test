@@ -40,9 +40,19 @@
  *   v2 日志已落位而快照未替换 → 重启补装快照完成迁移。任意时刻可裁决，
  *   绝不出现 verify 无法判定的 v1/v2 混杂（replay 对混杂直接报
  *   mixed-format-log / snapshot-log-format-mismatch 且 ok=false）。
+ *
+ * 时间点导出/恢复（PITR）：
+ * - exportAt(asOf) 只从当前快照锚点 + 当前 WAL 的已提交前缀重建状态，并且
+ *   asOf 必须精确等于某个 COMMIT 事务时间；未提交尾部、非事务边界、已被
+ *   压缩出当前 WAL 的更早状态都明确拒绝，绝不猜测。
+ * - follower 导出先等待链尖连续两轮稳定（只读轮询，不获取写锁、不阻塞
+ *   leader），因此导出的快照、WAL 前缀、truncation 锚点与 leader 同点一致。
+ * - 备份包在全新目录还原为 v2 snapshot.json + 截断到 COMMIT 的 events.log；
+ *   asOf 已过期的幂等键只在有效状态比较时按 TTL 剔除，包内 idempotency
+ *   字段说明取舍；快照与业务 WAL 均不重写，verify 仍以 v2 链为准。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { openSync, writeFileSync, writeSync, renameSync, fsyncSync, closeSync, readFileSync, mkdirSync, ftruncateSync, rmSync, existsSync, statSync } from 'node:fs'
+import { openSync, writeFileSync, writeSync, renameSync, fsyncSync, closeSync, readFileSync, mkdirSync, ftruncateSync, rmSync, existsSync, statSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { MemoryStore, IDEMPOTENCY_TTL_MS } from './memory.js'
 
@@ -55,6 +65,7 @@ export const LOG_V1_BACKUP = 'events.log.v1.bak'
 export const SNAPSHOT_V1_BACKUP = 'snapshot.json.v1.bak'
 const TMP_V2_LOG = '.events.log.v2.tmp'
 const TMP_V2_SNAPSHOT = '.snapshot.json.v2.tmp'
+const PITR_PACKAGE_FORMAT = 'scratch-pitr-v1'
 const SNAPSHOT_FORMAT_V1 = 'scratch-snapshot-v1'
 const SNAPSHOT_FORMAT_V2 = 'scratch-snapshot-v2'
 const SNAPSHOT_FORMATS = new Map([
@@ -72,6 +83,14 @@ export class ReadOnlyStoreError extends Error {
   constructor() {
     super('store is read-only follower: writes require the leader')
     this.code = 'read-only'
+  }
+}
+
+export class PitrExportError extends Error {
+  constructor(status, code, message) {
+    super(message)
+    this.status = status
+    this.code = code
   }
 }
 
@@ -262,6 +281,39 @@ function stateFromSnapshot(snapshot) {
   return state
 }
 
+function stateToObject(state, nowMs = Date.now(), pruneTtl = true) {
+  const idempotency = {}
+  for (const [key, entry] of state.idempotency) {
+    if (!pruneTtl || nowMs - entry.at <= IDEMPOTENCY_TTL_MS) idempotency[key] = entry
+  }
+  return {
+    sessions: Object.fromEntries(state.sessions),
+    days: Object.fromEntries(state.days),
+    cards: Object.fromEntries(state.cards),
+    idempotency,
+    claimsLedger: [...state.claimsLedger],
+    meta: Object.fromEntries(state.meta),
+    events: state.events,
+  }
+}
+
+function commitTimeOfOps(ops) {
+  let at = null
+  for (const op of ops) {
+    const candidates = [
+      op.event?.at,
+      op.session?.lastSeenAt ?? op.session?.createdAt,
+      op.record?.updatedAt ?? op.record?.createdAt ?? op.record?.beginAt,
+      op.entry?.at,
+      op.value,
+    ]
+    for (const value of candidates) {
+      if (typeof value === 'number' && Number.isFinite(value) && (at === null || value > at)) at = value
+    }
+  }
+  return at
+}
+
 /** 把一条已提交事务的全部 ops 重放进内存态 */
 function applyOps(state, ops) {
   for (const op of ops) {
@@ -333,6 +385,7 @@ function replayFromDisk(dir) {
   let offset = 0
   let logVersion = null // 日志内全部记录必须同版本；混杂即 mixed-format-log
   const migrations = [] // 链上 MIGRATE 记录（格式迁移事件，可审计）
+  let lastCommitAt = null
 
   // 当前进行中的事务组：ops + 组开始前的链游标/字节位置
   let groupOps = null
@@ -456,6 +509,7 @@ function replayFromDisk(dir) {
       prevHash = rec.hash
       validBytes = nextOffset
       lastLineEndedWithNewline = hasNewline
+      lastCommitAt = commitTimeOfOps(groupOps.ops)
       groupOps = null
       offset = nextOffset
       continue
@@ -550,8 +604,290 @@ function replayFromDisk(dir) {
     logVersion,
     snapshotVersion,
     migrations,
+    lastCommitAt,
   }
 }
+
+function readExportPoint(dir, asOfMs, ttlMs = IDEMPOTENCY_TTL_MS) {
+  const disk = replayFromDisk(dir)
+  const committedPrefixOnly =
+    !disk.formatConflict &&
+    disk.truncated &&
+    disk.anomalies.length > 0 &&
+    disk.anomalies.every((anomaly) => anomaly.code === 'truncation-anomaly')
+  if (disk.formatConflict || (!committedPrefixOnly && disk.anomalies.length > 0)) {
+    throw new PitrExportError(409, 'pitr-store-anomaly', 'audit chain is not currently clean enough for export')
+  }
+
+  const diskVersion = disk.logVersion ?? disk.snapshotVersion ?? null
+  const migration = disk.migrations.find((item) => item.from === 1 && item.to === 2)
+  if (diskVersion !== null && diskVersion < 2) {
+    throw new PitrExportError(
+      422,
+      'pitr-before-retained-history',
+      'asOf points into v1 history; retained v2 history starts after online migration',
+    )
+  }
+  if (migration && asOfMs <= migration.at) {
+    throw new PitrExportError(
+      422,
+      'pitr-before-retained-history',
+      'asOf points into v1 history; the v1 prefix is anchored but removed during migration',
+    )
+  }
+
+  let buffer
+  try {
+    buffer = readFileSync(join(dir, LOG_FILE))
+    if (committedPrefixOnly) buffer = buffer.subarray(0, disk.validBytes)
+  } catch (error) {
+    throw new PitrExportError(500, 'pitr-read-failed', String(error.message))
+  }
+
+  const records = []
+  let offset = 0
+  while (offset < buffer.length) {
+    const lineStart = offset
+    const newlineAt = buffer.indexOf(0x0a, offset)
+    const lineEnd = newlineAt === -1 ? buffer.length : newlineAt
+    const nextOffset = newlineAt === -1 ? lineEnd : newlineAt + 1
+    const rawLine = buffer.slice(lineStart, lineEnd).toString('utf8')
+    const rec = decodeLine(rawLine)
+    records.push({ rec, bytes: nextOffset, start: lineStart, end: nextOffset })
+    offset = nextOffset
+  }
+
+  let groupOps = null
+  let firstCommitAt = null
+  let matchingCommit = null
+  let matchingCommitAt = null
+  let entriesBefore = disk.snapshot ? disk.snapshot.records : 0
+
+  for (const item of records) {
+    const { rec } = item
+    if (rec.kind === 'GENESIS') {
+      entriesBefore += 1
+      groupOps = null
+      continue
+    }
+    if (rec.kind === 'MIGRATE') {
+      entriesBefore += 1
+      continue
+    }
+    if (rec.kind === 'APPLY') {
+      if (!groupOps) groupOps = { ops: [], entriesBefore }
+      groupOps.ops.push(rec.data.op)
+      entriesBefore += 1
+      continue
+    }
+    if (rec.kind !== 'COMMIT') {
+      throw new PitrExportError(500, 'pitr-read-failed', `unexpected record kind ${rec.kind}`)
+    }
+    const commitAt = commitTimeOfOps(groupOps?.ops ?? [])
+    if (commitAt === null) throw new PitrExportError(500, 'pitr-read-failed', 'commit has no timestamp')
+    firstCommitAt ??= commitAt
+    entriesBefore += 1
+    if (commitAt === asOfMs) {
+      if (matchingCommit) {
+        throw new PitrExportError(409, 'pitr-ambiguous-commit-boundary', 'multiple committed transactions share this timestamp')
+      }
+      matchingCommit = item
+      matchingCommitAt = commitAt
+    }
+    groupOps = null
+  }
+
+  if (matchingCommit === null) {
+    if (firstCommitAt === null || asOfMs < firstCommitAt) {
+      const code = migration || disk.snapshot ? 'pitr-before-retained-history' : 'pitr-before-first-commit'
+      const message = migration
+        ? 'asOf points into v1 history; retained v2 history starts after online migration'
+        : disk.snapshot
+          ? 'asOf predates the retained WAL start; the older prefix was compacted'
+          : 'asOf points before the first committed transaction'
+      throw new PitrExportError(422, code, message)
+    }
+    throw new PitrExportError(422, 'pitr-not-commit-boundary', 'asOf does not equal a committed transaction boundary')
+  }
+
+  const state = disk.snapshot ? stateFromSnapshot(disk.snapshot) : freshState()
+  let entries = disk.snapshot ? disk.snapshot.records : 0
+  let pendingOps = null
+  for (const item of records) {
+    const { rec } = item
+    if (rec.kind === 'GENESIS' || rec.kind === 'MIGRATE') {
+      entries += 1
+      continue
+    }
+    if (rec.kind === 'APPLY') {
+      pendingOps ??= []
+      pendingOps.push(rec.data.op)
+      entries += 1
+      continue
+    }
+    if (rec.kind === 'COMMIT') {
+      applyOps(state, pendingOps ?? [])
+      entries += 1
+      pendingOps = null
+      if (item === matchingCommit) break
+    }
+  }
+
+  const expiredIdempotencyKeys = []
+  for (const [key, entry] of state.idempotency) {
+    if (asOfMs - entry.at > ttlMs) expiredIdempotencyKeys.push(key)
+  }
+  const snapshot = disk.snapshot ? JSON.parse(JSON.stringify(disk.snapshot)) : null
+  const exportedState = stateToObject(state, asOfMs, true)
+  const genesis = records.find((item) => item.rec.kind === 'GENESIS')?.rec ?? null
+
+  return {
+    format: PITR_PACKAGE_FORMAT,
+    packageVersion: 1,
+    asOf: matchingCommitAt,
+    ttlMs,
+    snapshot,
+    snapshotChecksum: snapshot ? sha256Hex(canonicalJSON(snapshot)) : null,
+    log: buffer.slice(0, matchingCommit.bytes).toString('utf8'),
+    anchor: {
+      epoch: disk.epoch,
+      genesisHash: genesis?.hash ?? null,
+      prevEpochTip: disk.snapshot?.tipHash ?? ZERO_HASH,
+      prevEpochRecords: disk.snapshot?.records ?? 0,
+    },
+    truncation: {
+      entries,
+      tipHash: matchingCommit.rec.hash,
+      commitSeq: matchingCommit.rec.seq,
+      group: matchingCommit.rec.data.group,
+      logBytes: matchingCommit.bytes,
+    },
+    state: exportedState,
+    idempotency: {
+      ttlMs,
+      expiredAtAsOf: expiredIdempotencyKeys.sort(),
+      policy: 'expired idempotency records are excluded from effective state by TTL but are not rewritten out of the v2 chain',
+    },
+  }
+}
+
+function validateAndReplayBackup(pkg) {
+  if (!pkg || typeof pkg !== 'object' || pkg.format !== PITR_PACKAGE_FORMAT) {
+    throw new PitrExportError(400, 'pitr-invalid-package', 'unsupported PITR backup format')
+  }
+  if (pkg.packageChecksum) {
+    const copy = { ...pkg }
+    delete copy.packageChecksum
+    if (sha256Hex(canonicalJSON(copy)) !== pkg.packageChecksum) {
+      throw new PitrExportError(400, 'pitr-invalid-package', 'backup package checksum is invalid')
+    }
+  }
+  if (typeof pkg.asOf !== 'number' || !Number.isFinite(pkg.asOf)) {
+    throw new PitrExportError(400, 'pitr-invalid-package', 'PITR backup asOf is invalid')
+  }
+  if (typeof pkg.log !== 'string' || pkg.log.length === 0) {
+    throw new PitrExportError(400, 'pitr-invalid-package', 'PITR backup log is missing')
+  }
+  const ttlMs = typeof pkg.ttlMs === 'number' ? pkg.ttlMs : IDEMPOTENCY_TTL_MS
+  const state = pkg.snapshot ? stateFromSnapshot(pkg.snapshot) : freshState()
+  let expectedSeq = 1
+  let expectedHash = ZERO_HASH
+  let entries = pkg.snapshot ? pkg.snapshot.records : 0
+  let epoch = pkg.snapshot ? pkg.snapshot.epoch : 0
+  let pendingOps = null
+  let commitCount = 0
+  let lastCommit = null
+
+  const rawLines = pkg.log.split('\n')
+  const lines = rawLines[rawLines.length - 1] === '' ? rawLines.slice(0, -1) : rawLines
+  for (const line of lines) {
+    const rec = decodeLine(line)
+    if ((rec.v ?? 1) !== 2 || rec.seq !== expectedSeq || rec.prevHash !== expectedHash || rec.epoch !== epoch) {
+      throw new PitrExportError(400, 'pitr-invalid-package', 'backup log hash chain or anchor is invalid')
+    }
+    if (rec.kind === 'GENESIS') {
+      if (entries !== (pkg.snapshot ? pkg.snapshot.records : 0)) {
+        throw new PitrExportError(400, 'pitr-invalid-package', 'GENESIS is not at the exported segment start')
+      }
+      if (pkg.snapshot) {
+        if (
+          rec.data.snapshotId !== pkg.snapshot.snapshotId ||
+          rec.data.prevEpochTip !== pkg.snapshot.tipHash ||
+          rec.data.prevEpochRecords !== pkg.snapshot.records
+        ) {
+          throw new PitrExportError(400, 'pitr-invalid-package', 'GENESIS does not anchor to the snapshot')
+        }
+      } else if (rec.data.epoch !== 0 || rec.data.snapshotId !== undefined) {
+        throw new PitrExportError(400, 'pitr-invalid-package', 'primal GENESIS is invalid')
+      }
+    } else if (rec.kind === 'APPLY') {
+      pendingOps ??= []
+      pendingOps.push(rec.data.op)
+    } else if (rec.kind === 'COMMIT') {
+      if (!pendingOps || rec.data.n !== pendingOps.length || rec.data.n === 0) {
+        throw new PitrExportError(400, 'pitr-invalid-package', 'COMMIT group is incomplete')
+      }
+      applyOps(state, pendingOps)
+      pendingOps = null
+      commitCount += 1
+      lastCommit = rec
+    } else if (rec.kind === 'MIGRATE') {
+      if (!pkg.snapshot || rec.data.from !== 1 || rec.data.to !== 2) {
+        throw new PitrExportError(400, 'pitr-invalid-package', 'MIGRATE anchor is invalid')
+      }
+    } else {
+      throw new PitrExportError(400, 'pitr-invalid-package', `unsupported record kind ${rec.kind}`)
+    }
+    entries += 1
+    expectedSeq = rec.seq + 1
+    expectedHash = rec.hash
+  }
+
+  if (!lastCommit || commitCount === 0 || lastCommit.hash !== pkg.truncation?.tipHash) {
+    throw new PitrExportError(400, 'pitr-invalid-package', 'backup does not end at a COMMIT boundary')
+  }
+  if (pkg.truncation.entries !== entries || pkg.truncation.commitSeq !== lastCommit.seq) {
+    throw new PitrExportError(400, 'pitr-invalid-package', 'backup truncation anchor is invalid')
+  }
+  const expectedState = stateToObject(state, pkg.asOf, true)
+  if (pkg.state && canonicalJSON(pkg.state) !== canonicalJSON(expectedState)) {
+    throw new PitrExportError(400, 'pitr-invalid-package', 'backup state is not reproducible from its log')
+  }
+  return { state: expectedState, entries, tipHash: lastCommit.hash, ttlMs }
+}
+
+export function restorePackageIntoDir(dir, packageInput, { allowExisting = false } = {}) {
+  let pkg
+  try {
+    pkg = typeof packageInput === 'string' ? JSON.parse(readFileSync(packageInput, 'utf8')) : packageInput
+  } catch (error) {
+    throw new PitrExportError(400, 'pitr-invalid-package', `backup package is not valid JSON: ${error.message}`)
+  }
+  const replay = validateAndReplayBackup(pkg)
+  mkdirSync(dir, { recursive: true })
+  const existing = readdirSync(dir).filter((name) => name !== LOCK_DIR)
+  if (!allowExisting && existing.length > 0) {
+    throw new PitrExportError(409, 'pitr-restore-dir-not-empty', 'restore requires a new empty data directory')
+  }
+  let writtenSnapshot = pkg.snapshot
+  if (pkg.snapshot) {
+    const checksum = sha256Hex(canonicalJSON(pkg.snapshot))
+    if (pkg.snapshotChecksum && pkg.snapshotChecksum !== checksum) {
+      throw new PitrExportError(400, 'pitr-invalid-package', 'snapshot checksum is invalid')
+    }
+    if (pkg.snapshot.format !== SNAPSHOT_FORMAT_V2) {
+      throw new PitrExportError(400, 'pitr-invalid-package', 'restored snapshot must be v2')
+    }
+    const snapshotFile = `${canonicalJSON(pkg.snapshot)}\n${checksum}\n`
+    writeFileSync(join(dir, SNAPSHOT_FILE), snapshotFile)
+  }
+  writeFileSync(join(dir, LOG_FILE), pkg.log)
+  fsyncFile(join(dir, LOG_FILE))
+  if (pkg.snapshot) fsyncFile(join(dir, SNAPSHOT_FILE))
+  fsyncDir(dir)
+  return replay
+}
+
 export class FileStore extends MemoryStore {
   /**
    * @param {string} dir 数据目录（不存在则创建）
@@ -592,6 +928,7 @@ export class FileStore extends MemoryStore {
     this.tipHash = null
     this.logBytes = 0
     this.totalRecords = 0 // 跨快照累计的哈希链记录条数（审计 entries）
+    this.lastCommitAt = null
     this.fd = null
     this.role = 'follower'
     this.diskVersion = null // 磁盘数据当前的格式版本（1|2）
@@ -602,6 +939,9 @@ export class FileStore extends MemoryStore {
     this.pollTimer = null
 
     mkdirSync(dir, { recursive: true })
+    if (opts.restorePackage) {
+      restorePackageIntoDir(dir, opts.restorePackage, { allowExisting: opts.allowRestoreIntoExisting === true })
+    }
     if (this.requestedRole !== 'follower' && this._tryAcquireLock()) {
       this.role = 'leader'
       this._adjudicateMigration()
@@ -819,6 +1159,7 @@ export class FileStore extends MemoryStore {
     this.epoch = disk.epoch
     this.tipHash = disk.tipHash
     this.totalRecords = disk.entries
+    this.lastCommitAt = disk.lastCommitAt
     this.logBytes = disk.validBytes
     this.migrations = disk.migrations
   }
@@ -840,6 +1181,49 @@ export class FileStore extends MemoryStore {
     if (disk.tipHash === this.tipHash && disk.entries === this.totalRecords) return false
     this._adoptDiskState(disk)
     return true
+  }
+
+  async exportAt(asOfMs, { catchUpTimeoutMs = 2_000 } = {}) {
+    if (!this.persistent) {
+      throw new PitrExportError(409, 'pitr-persistence-unavailable', 'point-in-time export requires a persistent store')
+    }
+    if (typeof asOfMs !== 'number' || !Number.isFinite(asOfMs)) {
+      throw new PitrExportError(400, 'pitr-invalid-as-of', 'asOf must be a millisecond timestamp')
+    }
+
+    if (this.role === 'follower') await this.waitForLeaderCatchUp(catchUpTimeoutMs)
+    const backup = readExportPoint(this.dir, asOfMs)
+    const checksum = sha256Hex(canonicalJSON(backup))
+    return { ...backup, packageChecksum: checksum }
+  }
+
+  async waitForLeaderCatchUp(timeoutMs = 2_000) {
+    if (this.role !== 'follower') return true
+    const deadline = Date.now() + timeoutMs
+    let previousTip = null
+    for (;;) {
+      this.refresh()
+      let disk
+      try {
+        disk = replayFromDisk(this.dir)
+      } catch {
+        disk = null
+      }
+      const stable =
+        disk &&
+        !disk.truncated &&
+        !disk.formatConflict &&
+        disk.anomalies.length === 0 &&
+        disk.tipHash !== ZERO_HASH &&
+        disk.tipHash === this.tipHash &&
+        disk.tipHash === previousTip
+      if (stable) return true
+      previousTip = disk?.tipHash ?? null
+      if (Date.now() >= deadline) {
+        throw new PitrExportError(503, 'pitr-follower-behind', 'follower has not caught up with the leader')
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
   }
 
   _markAnomaly(code, detail) {
@@ -1182,6 +1566,7 @@ export class FileStore extends MemoryStore {
 
     this.seq = chainSeq
     this.tipHash = commitRec.hash
+    this.lastCommitAt = commitTimeOfOps(ops)
     this.totalRecords += encoded.length
     this.logBytes += Buffer.byteLength(payload)
     this.staged = []
@@ -1217,9 +1602,11 @@ export class FileStore extends MemoryStore {
       snapshotId,
       createdAt: Date.now(),
       tipHash: this.tipHash,
+      tipKind: 'commit',
+      tipAt: this.lastCommitAt ?? null,
       records: this.totalRecords,
       genesisHash: null,
-      state: this._dumpState(),
+      state: this._dumpState(Date.now(), false),
     }
     const genesis = genesisRecord(nextEpoch, {
       snapshotId,
@@ -1317,9 +1704,11 @@ export class FileStore extends MemoryStore {
       snapshotId,
       createdAt: Date.now(),
       tipHash: v1Tip,
+      tipKind: 'v1-commit',
+      tipAt: this.lastCommitAt,
       records: v1Records,
       genesisHash: genesis.hash,
-      state: this._dumpState(),
+      state: this._dumpState(Date.now(), false),
     }
     const snapshotFile = `${canonicalJSON(snapshot)}\n${sha256Hex(canonicalJSON(snapshot))}\n`
     const logFile = encodeRecord(genesis) + encodeRecord(migrateRec)
@@ -1432,10 +1821,10 @@ export class FileStore extends MemoryStore {
 
   // ---------- 审计 ----------
   /** 规范化可比较状态（剔除已过期幂等键，避免 TTL 造成伪分叉） */
-  _dumpState(nowMs = Date.now()) {
+  _dumpState(nowMs = Date.now(), pruneTtl = true) {
     const idempotency = {}
     for (const [key, entry] of this.idempotency) {
-      if (nowMs - entry.at <= IDEMPOTENCY_TTL_MS) idempotency[key] = entry
+      if (!pruneTtl || nowMs - entry.at <= IDEMPOTENCY_TTL_MS) idempotency[key] = entry
     }
     return {
       sessions: Object.fromEntries(this.sessions),
@@ -1505,6 +1894,7 @@ export class FileStore extends MemoryStore {
       ok,
       persistent: true,
       entries: disk.entries,
+      tipHash: disk.tipHash,
       firstBrokenSeq: disk.firstBrokenSeq,
       anomalies,
       format: disk.logVersion ?? disk.snapshotVersion ?? this.diskVersion ?? this.formatVersion,

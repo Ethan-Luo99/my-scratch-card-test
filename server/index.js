@@ -15,5 +15,8 @@ const handler = createServerApp({
 
 const server = createServer(handler)
 server.listen(port, () => {
-  console.log(`scratch-card server listening on http://localhost:${port}`)
+  const store = handler.store
+  const role = store?.role ?? 'single'
+  const dir = store?.dir ?? '(memory)'
+  console.log(`scratch-card server listening on http://localhost:${port} role=${role} dir=${dir}`)
 })

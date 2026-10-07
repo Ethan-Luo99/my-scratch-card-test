@@ -92,6 +92,9 @@ export function createServerApp(options = {}) {
     const cookies = parseCookies(req)
     const sid = cookies[SESSION_COOKIE] || null
 
+    // follower 请求级刷新：读取前追上 leader 新提交（leader 调用为空操作）
+    if (typeof store.refresh === 'function') store.refresh()
+
     const idempotencyKey = req.headers['idempotency-key']
       ? String(req.headers['idempotency-key']).slice(0, 200)
       : null
@@ -109,7 +112,7 @@ export function createServerApp(options = {}) {
       if (method === 'GET' && matchPath(pathname, '/healthz')) {
         return sendJson(res, {
           status: 200,
-          body: { ...engine.health(), isPersistent: store.isPersistent !== false },
+          body: { ...engine.health(), isPersistent: store.isPersistent !== false, role: store.role ?? 'single' },
         })
       }
       if (method === 'GET' && matchPath(pathname, '/verification-key')) {
@@ -197,6 +200,13 @@ export function createServerApp(options = {}) {
 
       return sendJson(res, { status: 404, body: { error: 'not-found' } })
     } catch (error) {
+      if (error && error.code === 'read-only') {
+        // follower 实例：业务写明确拒绝（读路径不受影响）
+        return sendJson(res, {
+          status: 503,
+          body: { error: 'read-only', message: 'instance is a read-only follower; writes require the leader' },
+        })
+      }
       if (error instanceof EngineError) {
         return sendJson(res, { status: error.status, body: { error: error.error, message: error.message } })
       }
@@ -215,5 +225,6 @@ export function createServerApp(options = {}) {
     })
   }
   handler.engine = engine
+  handler.store = store
   return handler
 }

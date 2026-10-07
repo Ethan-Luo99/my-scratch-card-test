@@ -18,18 +18,62 @@
  * - verifyAudit() 从磁盘独立重建哈希链并重放状态，与当前内存逐项比对。
  * - 快照压缩后链从新创世重建（genesis 携带 epoch/snapshotId 与前链 tip 锚点），
  *   verify 仍可跨“快照状态 + 当前日志”全量校验。
+ *
+ * 多实例（leader/follower）：
+ * - 同一数据目录用目录锁 leader.lock/ 保证单写者：mkdir 原子占位，锁内
+ *   lock.json 心跳（heartbeatAt）。正常 close 释放锁 → 立即可接管；进程死亡
+ *   时心跳停摆，超过 lockStaleMs（或 pid 已不存在）后由 takeover 原子
+ *   rename 认领（rename 只有一个赢家，防并发接管；认领失败方退为 follower，
+ *   绝不双写）。
+ * - follower 只读：启动回放一次 + 周期轮询 refresh() 增量跟随 leader 提交；
+ *   读路径只读文件、绝不写目录，因此不阻塞 leader 写路径。写操作抛
+ *   ReadOnlyStoreError（HTTP 层映射 423 read-only）。
+ *
+ * 存储格式 v2 与在线迁移：
+ * - v2 记录携带 v:2（参与哈希），快照 format=scratch-snapshot-v2；v1 数据
+ *   （无 v 字段 / scratch-snapshot-v1）由 leader 启动时自动无损迁移。
+ * - 迁移 = 以 v1 链 tip 为锚做一次 v2 快照压缩，并在新链第 2 条写入
+ *   MIGRATE 记录（迁移事件进哈希链，事后可审计）；v1 原文件保留为
+ *   *.v1.bak 审计轨迹，v2 创世经 prevEpochTip 锚定 v1 链尖。
+ * - 崩溃安全：提交点 = events.log 首条记录变为 v2。之前的崩溃留下 tmp 孤儿
+ *   （清理即可，仍是纯 v1）；v1 已改名备份而 v2 未落位 → 重启回滚到 v1；
+ *   v2 日志已落位而快照未替换 → 重启补装快照完成迁移。任意时刻可裁决，
+ *   绝不出现 verify 无法判定的 v1/v2 混杂（replay 对混杂直接报
+ *   mixed-format-log / snapshot-log-format-mismatch 且 ok=false）。
  */
-import { createHash } from 'node:crypto'
-import { openSync, writeFileSync, writeSync, renameSync, fsyncSync, closeSync, readFileSync, mkdirSync, ftruncateSync, rmSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { openSync, writeFileSync, writeSync, renameSync, fsyncSync, closeSync, readFileSync, mkdirSync, ftruncateSync, rmSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { MemoryStore, IDEMPOTENCY_TTL_MS } from './memory.js'
 
 export const LOG_FILE = 'events.log'
 export const SNAPSHOT_FILE = 'snapshot.json'
 export const ZERO_HASH = '0'.repeat(64)
-const SNAPSHOT_FORMAT = 'scratch-snapshot-v1'
+export const LOG_FORMAT_VERSION = 2
+export const LOCK_DIR = 'leader.lock'
+export const LOG_V1_BACKUP = 'events.log.v1.bak'
+export const SNAPSHOT_V1_BACKUP = 'snapshot.json.v1.bak'
+const TMP_V2_LOG = '.events.log.v2.tmp'
+const TMP_V2_SNAPSHOT = '.snapshot.json.v2.tmp'
+const SNAPSHOT_FORMAT_V1 = 'scratch-snapshot-v1'
+const SNAPSHOT_FORMAT_V2 = 'scratch-snapshot-v2'
+const SNAPSHOT_FORMATS = new Map([
+  [SNAPSHOT_FORMAT_V1, 1],
+  [SNAPSHOT_FORMAT_V2, 2],
+])
 const DEFAULT_SNAPSHOT_EVERY_LINES = 1000
 const DEFAULT_SNAPSHOT_EVERY_BYTES = 256 * 1024
+const DEFAULT_LOCK_STALE_MS = 5000
+const DEFAULT_HEARTBEAT_MS = 1000
+const DEFAULT_FOLLOWER_POLL_MS = 1000
+
+/** follower 上的写操作：HTTP 层映射为 423 {error:'read-only'} */
+export class ReadOnlyStoreError extends Error {
+  constructor() {
+    super('store is read-only follower: writes require the leader')
+    this.code = 'read-only'
+  }
+}
 
 /** 确定性 JSON（键字典序递归），保证跨进程哈希/比对稳定 */
 export function canonicalJSON(value) {
@@ -41,6 +85,38 @@ export function canonicalJSON(value) {
 
 function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+function pidAlive(pid) {
+  if (typeof pid !== 'number' || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+function fsyncFile(path) {
+  const fd = openSync(path, 'r+')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function fsyncDir(dir) {
+  try {
+    const fd = openSync(dir, 'r')
+    try {
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    // 目录 fsync 在个别平台不可用：文件内容已 fsync，忽略
+  }
 }
 
 function clone(value) {
@@ -59,17 +135,17 @@ function idemKeyOf(sid, scope, key) {
   return `${sid}#${scope}#${key}`
 }
 
-/** 记录内容哈希：固定字段顺序，hash 字段本身不参与 */
+/** 记录内容哈希：固定字段顺序，hash 字段本身不参与；v 仅在显式携带时入哈希（v1 旧链哈希不变） */
 function hashRecord(rec) {
-  return sha256Hex(
-    canonicalJSON({
-      seq: rec.seq,
-      kind: rec.kind,
-      prevHash: rec.prevHash,
-      epoch: rec.epoch,
-      data: rec.data,
-    }),
-  )
+  const payload = {
+    seq: rec.seq,
+    kind: rec.kind,
+    prevHash: rec.prevHash,
+    epoch: rec.epoch,
+    data: rec.data,
+  }
+  if (rec.v != null) payload.v = rec.v
+  return sha256Hex(canonicalJSON(payload))
 }
 
 function encodeRecord(rec) {
@@ -81,6 +157,7 @@ function encodeRecord(rec) {
     epoch: rec.epoch,
     data: rec.data,
   }
+  if (rec.v != null) body.v = rec.v
   const line = JSON.stringify(body)
   const checksum = sha256Hex(line)
   return `${line}|${checksum}\n`
@@ -105,13 +182,17 @@ function decodeLine(rawLine) {
   ) {
     throw new Error('malformed record: shape')
   }
+  if (rec.v !== undefined && rec.v !== 1 && rec.v !== 2) {
+    throw new Error('malformed record: unsupported format version')
+  }
   if (hashRecord(rec) !== rec.hash) throw new Error('hash mismatch')
   return rec
 }
 
-function genesisRecord(epoch, extra = {}) {
+function genesisRecord(epoch, extra = {}, version = 1) {
   const data = { t: 'genesis', epoch, ...extra }
   const rec = { seq: 1, kind: 'GENESIS', prevHash: ZERO_HASH, hash: null, epoch, data }
+  if (version >= 2) rec.v = version
   rec.hash = hashRecord(rec)
   return rec
 }
@@ -144,15 +225,16 @@ function readSnapshot(snapshotPath) {
   } catch {
     return { status: 'corrupt', reason: 'snapshot not JSON' }
   }
+  const version = snapshot ? SNAPSHOT_FORMATS.get(snapshot.format) : undefined
   if (
     !snapshot ||
-    snapshot.format !== SNAPSHOT_FORMAT ||
+    version === undefined ||
     !/^[0-9a-f]{64}$/.test(checksum) ||
     sha256Hex(canonicalJSON(snapshot)) !== checksum
   ) {
     return { status: 'corrupt', reason: 'snapshot checksum/shape mismatch' }
   }
-  return { status: 'ok', snapshot }
+  return { status: 'ok', snapshot, version }
 }
 
 function freshState() {
@@ -222,10 +304,12 @@ function replayFromDisk(dir) {
   const anomalies = []
   let snapshotInfo = readSnapshot(snapshotPath)
   let snapshot = null
+  let snapshotVersion = null
   if (snapshotInfo.status === 'corrupt') {
     anomalies.push({ code: 'snapshot-corrupt', detail: snapshotInfo.reason })
   } else if (snapshotInfo.status === 'ok') {
     snapshot = snapshotInfo.snapshot
+    snapshotVersion = snapshotInfo.version
   }
 
   let buffer
@@ -245,7 +329,10 @@ function replayFromDisk(dir) {
   let lastLineEndedWithNewline = true
   let firstBrokenSeq
   let truncated = false
+  let formatConflict = false
   let offset = 0
+  let logVersion = null // 日志内全部记录必须同版本；混杂即 mixed-format-log
+  const migrations = [] // 链上 MIGRATE 记录（格式迁移事件，可审计）
 
   // 当前进行中的事务组：ops + 组开始前的链游标/字节位置
   let groupOps = null
@@ -276,6 +363,12 @@ function replayFromDisk(dir) {
     }
 
     const nextOffset = hasNewline ? lineEnd + 1 : lineEnd
+    const recVersion = rec.v ?? 1
+    if (logVersion === null) logVersion = recVersion
+    else if (recVersion !== logVersion) {
+      stop('mixed-format log: v1/v2 records interleaved', rec.seq)
+      break
+    }
 
     if (rec.kind === 'GENESIS') {
       if (groupOps || entries !== (snapshot ? snapshot.records : 0) || rec.seq !== 1) {
@@ -368,6 +461,37 @@ function replayFromDisk(dir) {
       continue
     }
 
+    if (rec.kind === 'MIGRATE') {
+      // 格式迁移事件：纯链记录（无业务 ops），必须出现在组外且为 v2
+      const d = rec.data ?? {}
+      if (
+        groupOps ||
+        recVersion !== 2 ||
+        d.t !== 'format-migration' ||
+        d.from !== 1 ||
+        d.to !== 2 ||
+        typeof d.at !== 'number'
+      ) {
+        stop('malformed MIGRATE record', rec.seq)
+        break
+      }
+      migrations.push({
+        seq: rec.seq,
+        at: d.at,
+        from: d.from,
+        to: d.to,
+        v1TipHash: d.v1TipHash ?? null,
+        v1Records: d.v1Records ?? null,
+      })
+      entries += 1
+      expectedSeq = rec.seq + 1
+      prevHash = rec.hash
+      validBytes = nextOffset
+      lastLineEndedWithNewline = hasNewline
+      offset = nextOffset
+      continue
+    }
+
     stop(`unknown record kind ${rec.kind}`, rec.seq)
     break
   }
@@ -382,6 +506,16 @@ function replayFromDisk(dir) {
     entries -= groupOps.ops.length
     validBytes = groupOps.bytes
     lastLineEndedWithNewline = groupOps.newlines
+  }
+
+  // 快照与日志格式版本必须一致（v1 快照 + v2 日志只可能出现在迁移崩溃窗口，
+  // 由启动裁决修复；到达这里即不可服务的混杂态，verify 判负而非猜）
+  if (snapshot && logVersion !== null && snapshotVersion !== logVersion) {
+    formatConflict = true
+    anomalies.push({
+      code: 'snapshot-log-format-mismatch',
+      detail: `snapshot v${snapshotVersion} vs log v${logVersion}`,
+    })
   }
 
   // 承诺顺序不变量（D21 语义的磁盘侧复核）：同一卡 commitment 事件生效序号
@@ -405,6 +539,7 @@ function replayFromDisk(dir) {
     snapshot,
     anomalies,
     truncated,
+    formatConflict,
     firstBrokenSeq,
     entries,
     epoch,
@@ -412,6 +547,9 @@ function replayFromDisk(dir) {
     validBytes,
     lastLineEndedWithNewline,
     logSize: buffer.length,
+    logVersion,
+    snapshotVersion,
+    migrations,
   }
 }
 export class FileStore extends MemoryStore {
@@ -420,6 +558,11 @@ export class FileStore extends MemoryStore {
    * @param {object} [opts]
    * @param {number} [opts.snapshotEveryLines] 日志每多少行触发一次快照压缩
    * @param {number} [opts.snapshotEveryBytes] 日志累计写字节触发阈值
+   * @param {number} [opts.formatVersion] 写入格式版本（默认 2；1 仅用于测试夹具生成 v1 数据）
+   * @param {'auto'|'leader'|'follower'} [opts.role] auto=能拿锁则 leader 否则 follower
+   * @param {number} [opts.lockStaleMs] 心跳停摆多久后锁可被接管
+   * @param {number} [opts.heartbeatMs] leader 心跳间隔
+   * @param {number} [opts.followerPollMs] follower 轮询跟随间隔
    * @param {function} [opts.logger]
    * @param {object} [opts.faults] 测试故障注入（命中一次即失效）
    */
@@ -429,8 +572,14 @@ export class FileStore extends MemoryStore {
     this.logPath = join(dir, LOG_FILE)
     this.snapshotPath = join(dir, SNAPSHOT_FILE)
     this.tmpSnapshotPath = join(dir, `.${SNAPSHOT_FILE}.tmp`)
+    this.lockDirPath = join(dir, LOCK_DIR)
     this.snapshotEveryLines = opts.snapshotEveryLines ?? DEFAULT_SNAPSHOT_EVERY_LINES
     this.snapshotEveryBytes = opts.snapshotEveryBytes ?? DEFAULT_SNAPSHOT_EVERY_BYTES
+    this.formatVersion = opts.formatVersion ?? LOG_FORMAT_VERSION
+    this.requestedRole = opts.role ?? 'auto'
+    this.lockStaleMs = opts.lockStaleMs ?? DEFAULT_LOCK_STALE_MS
+    this.heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
+    this.followerPollMs = opts.followerPollMs ?? DEFAULT_FOLLOWER_POLL_MS
     this.logger = opts.logger ?? null
     this.faults = opts.faults ?? null
     this.faultCounts = new Map()
@@ -444,16 +593,50 @@ export class FileStore extends MemoryStore {
     this.logBytes = 0
     this.totalRecords = 0 // 跨快照累计的哈希链记录条数（审计 entries）
     this.fd = null
+    this.role = 'follower'
+    this.diskVersion = null // 磁盘数据当前的格式版本（1|2）
+    this.migrations = [] // 链上格式迁移事件（来自 replay / 本实例迁移）
+    this.lockToken = null
+    this.lockAcquiredAt = null
+    this.heartbeatTimer = null
+    this.pollTimer = null
 
     mkdirSync(dir, { recursive: true })
-    this._recover()
+    if (this.requestedRole !== 'follower' && this._tryAcquireLock()) {
+      this.role = 'leader'
+      this._adjudicateMigration()
+      this._recover()
+      if (this.persistent && this.formatVersion >= 2 && this.diskVersion === 1) {
+        // v1 旧数据：启动即在线迁移为 v2（崩溃安全见 _adjudicateMigration）
+        this._migrateToV2()
+      }
+    } else {
+      if (this.requestedRole === 'leader') {
+        throw new Error('leader lock is held by another instance')
+      }
+      this.role = 'follower'
+      this._recoverFollower()
+    }
   }
 
   get isPersistent() {
     return this.persistent
   }
 
+  get readOnly() {
+    return this.role === 'follower'
+  }
+
   close() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+    if (this.role !== 'leader') return // follower 不持有任何写资源
     this._flush()
     if (this.fd !== null) {
       try {
@@ -464,6 +647,7 @@ export class FileStore extends MemoryStore {
       closeSync(this.fd)
       this.fd = null
     }
+    this._releaseLock()
   }
 
   // ---------- 降级 ----------
@@ -486,6 +670,176 @@ export class FileStore extends MemoryStore {
 
   _logWarn(event, extra) {
     if (this.logger) this.logger({ level: 'warn', event, ...extra })
+  }
+
+  // ---------- 单写者锁（目录锁 + 心跳） ----------
+  /**
+   * mkdir 原子占位：成功者唯一。已存在则读 lock.json 判断陈旧：
+   * 心跳停摆超 lockStaleMs 或 pid 已死亡 → rename 原子认领（认领动作本身
+   * 只有一个赢家），随后重试 mkdir；mkdir 仍失败说明被他人抢先，退 follower。
+   */
+  _tryAcquireLock() {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        mkdirSync(this.lockDirPath)
+        this.lockToken = randomUUID()
+        this.lockAcquiredAt = Date.now()
+        this._writeLockMeta()
+        this.heartbeatTimer = setInterval(() => this._writeLockMeta(), this.heartbeatMs)
+        if (this.heartbeatTimer.unref) this.heartbeatTimer.unref()
+        return true
+      } catch (error) {
+        if (error.code !== 'EEXIST') {
+          // 目录不可写等：auto 模式退为只读 follower（读路径不需要锁）
+          if (this.requestedRole === 'leader') throw error
+          this._logWarn('lock-unavailable', { error: String(error?.message ?? error) })
+          return false
+        }
+        if (attempt === 0 && this._tryTakeoverStaleLock()) continue
+        return false
+      }
+    }
+    return false
+  }
+
+  _writeLockMeta() {
+    if (!this.lockToken) return
+    try {
+      const meta = {
+        pid: process.pid,
+        token: this.lockToken,
+        acquiredAt: this.lockAcquiredAt,
+        heartbeatAt: Date.now(),
+      }
+      const tmpPath = join(this.lockDirPath, `.lock.json.${process.pid}.tmp`)
+      writeFileSync(tmpPath, JSON.stringify(meta))
+      renameSync(tmpPath, join(this.lockDirPath, 'lock.json'))
+    } catch {
+      // 心跳失败不致命（锁目录被外部清理等）：下次心跳再试
+    }
+  }
+
+  _readLockMeta() {
+    try {
+      const meta = JSON.parse(readFileSync(join(this.lockDirPath, 'lock.json'), 'utf8'))
+      if (meta && typeof meta.heartbeatAt === 'number') return meta
+    } catch {
+      // 锁目录存在但元数据缺失/损坏：交由调用方按目录年龄裁决
+    }
+    return null
+  }
+
+  _tryTakeoverStaleLock() {
+    const now = Date.now()
+    const meta = this._readLockMeta()
+    let stale
+    if (meta) {
+      stale = now - meta.heartbeatAt > this.lockStaleMs || !pidAlive(meta.pid)
+    } else {
+      // 无有效元数据：可能是他人 mkdir 后尚未写 lock.json 的窗口，
+      // 只有目录本身也超过 lockStaleMs 未更新才允许认领，防误杀新 leader
+      try {
+        stale = now - statSync(this.lockDirPath).mtimeMs > this.lockStaleMs
+      } catch {
+        stale = false
+      }
+    }
+    if (!stale) return false
+    // rename 原子认领：并发接管者只有一个成功；输家下次循环看到新锁退 follower
+    const orphanPath = `${this.lockDirPath}.orphan-${process.pid}-${now}`
+    try {
+      renameSync(this.lockDirPath, orphanPath)
+    } catch {
+      return false
+    }
+    try {
+      rmSync(orphanPath, { recursive: true, force: true })
+    } catch {
+      // 孤儿清理失败不影响锁获取
+    }
+    return true
+  }
+
+  _releaseLock() {
+    // 只释放自己持有的锁（token 匹配）：锁被他人接管后不得误删新锁
+    try {
+      const meta = this._readLockMeta()
+      if (meta && meta.token !== this.lockToken) return
+      if (!meta) return
+      rmSync(this.lockDirPath, { recursive: true, force: true })
+    } catch {
+      // 释放失败留下的是陈旧锁，由 stale 接管路径兜底
+    }
+    this.lockToken = null
+  }
+
+  /** 模拟进程当场死亡：停心跳、释放锁、丢 fd（真实崩溃的进程内模拟） */
+  _simulateProcessDeath() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+    try {
+      rmSync(this.lockDirPath, { recursive: true, force: true })
+    } catch {
+      // 忽略
+    }
+    this.lockToken = null
+    if (this.fd !== null) {
+      try {
+        closeSync(this.fd)
+      } catch {
+        // fd 可能已失效
+      }
+      this.fd = null
+    }
+    this.staged = []
+  }
+
+  // ---------- follower：只读回放 + 轮询跟随 ----------
+  _recoverFollower() {
+    try {
+      this._adoptDiskState(replayFromDisk(this.dir))
+    } catch (error) {
+      // 磁盘暂不可读（leader 迁移窗口等）：以空状态启动，轮询自愈
+      this._logWarn('follower-initial-replay-failed', { error: String(error?.message ?? error) })
+    }
+    this.pollTimer = setInterval(() => this.refresh(), this.followerPollMs)
+    if (this.pollTimer.unref) this.pollTimer.unref()
+  }
+
+  _adoptDiskState(disk) {
+    this.sessions = disk.state.sessions
+    this.days = disk.state.days
+    this.cards = disk.state.cards
+    this.idempotency = disk.state.idempotency
+    this.claimsLedger = disk.state.claimsLedger
+    this.meta = disk.state.meta
+    this.events = disk.state.events
+    this.epoch = disk.epoch
+    this.tipHash = disk.tipHash
+    this.totalRecords = disk.entries
+    this.logBytes = disk.validBytes
+    this.migrations = disk.migrations
+  }
+
+  /**
+   * follower 增量跟随：重放磁盘并在链尖前进时热切换内存态。
+   * 读到撕裂/混杂（leader 正在写或迁移）时跳过本轮，下轮收敛；
+   * 全程只读文件，绝不阻塞 leader 写路径。
+   */
+  refresh() {
+    if (this.role !== 'follower') return false
+    let disk
+    try {
+      disk = replayFromDisk(this.dir)
+    } catch {
+      return false
+    }
+    if (disk.truncated || disk.formatConflict || disk.anomalies.length > 0) return false
+    if (disk.tipHash === this.tipHash && disk.entries === this.totalRecords) return false
+    this._adoptDiskState(disk)
+    return true
   }
 
   _markAnomaly(code, detail) {
@@ -523,18 +877,18 @@ export class FileStore extends MemoryStore {
       throw new Error(`log recovery failed: ${error.message}`)
     }
 
-    this.sessions = disk.state.sessions
-    this.days = disk.state.days
-    this.cards = disk.state.cards
-    this.idempotency = disk.state.idempotency
-    this.claimsLedger = disk.state.claimsLedger
-    this.meta = disk.state.meta
-    this.events = disk.state.events
-    this.epoch = disk.epoch
+    // 混杂态只能由 _adjudicateMigration 先行修复；到这里仍混杂 = 无法裁决，拒绝启动
+    if (disk.formatConflict) {
+      throw new Error('log recovery failed: snapshot/log format version conflict')
+    }
+    const diskVersion = disk.logVersion ?? disk.snapshotVersion ?? null
+    if (diskVersion !== null && diskVersion > this.formatVersion) {
+      throw new Error(`log recovery failed: format v${diskVersion} is newer than supported v${this.formatVersion}`)
+    }
+    this.diskVersion = diskVersion ?? this.formatVersion
+
+    this._adoptDiskState(disk)
     this.seq = 1 // 每代创世恒为 seq=1；真正末条游标在日志重开后按磁盘末行确定
-    this.tipHash = disk.tipHash
-    this.totalRecords = disk.entries
-    this.logBytes = disk.validBytes
     for (const anomaly of disk.anomalies) this.anomalies.push(anomaly)
 
     // 日志缺失/为空，或整条日志没有任何有效提交记录（首行即垃圾）：
@@ -550,13 +904,15 @@ export class FileStore extends MemoryStore {
 
     if (needsGenesis) {
       try {
+        // 有快照时创世版本与快照一致（迁移会随后整体升级），否则按本实例写入版本
+        const genesisVersion = disk.snapshot ? disk.snapshotVersion : this.formatVersion
         const genesis = disk.snapshot
           ? genesisRecord(disk.epoch, {
               snapshotId: disk.snapshot.snapshotId,
               prevEpochTip: disk.snapshot.tipHash,
               prevEpochRecords: disk.snapshot.records,
-            })
-          : genesisRecord(0)
+            }, genesisVersion)
+          : genesisRecord(0, {}, genesisVersion)
         // 整文件重写：既覆盖“首行即垃圾”（validBytes=0），也覆盖空/缺失文件
         const encoded = encodeRecord(genesis)
         writeFileSync(this.logPath, encoded)
@@ -622,18 +978,25 @@ export class FileStore extends MemoryStore {
     this.staged.push(op)
   }
 
+  _assertWritable() {
+    if (this.readOnly) throw new ReadOnlyStoreError()
+  }
+
   /** 临界区末尾钩子（MemoryStore 无此方法 → 无副作用） */
   afterCriticalSection() {
+    if (this.readOnly) return
     this._flush()
   }
 
   /** createSession 不在 withSidLock 内（sid 尚不存在），由 app 层显式调用 */
   flushPending() {
+    if (this.readOnly) return
     this._flush()
   }
 
   // ---------- sessions ----------
   createSession(nowMs) {
+    this._assertWritable()
     const sid = super.createSession(nowMs).sid
     // 复用父类构造的对象作为活工作副本（同进程立即可见）；落盘以事务末尾克隆为准
     const session = this.sessions.get(sid)
@@ -643,7 +1006,8 @@ export class FileStore extends MemoryStore {
 
   touchSession(session, nowMs) {
     super.touchSession(session, nowMs)
-    this._stage({ t: 'session-upsert', sid: session.sid, session: clone(session) })
+    // follower：会话触碰属临时元数据，只更新内存、不落盘（读请求不算写）
+    if (!this.readOnly) this._stage({ t: 'session-upsert', sid: session.sid, session: clone(session) })
   }
 
   noteClock(session, { currentDayKey, nowMs }) {
@@ -654,11 +1018,12 @@ export class FileStore extends MemoryStore {
     if (nowMs < session.maxObservedMs) session.clockAnomaly = true
     if (nowMs > session.maxObservedMs) session.maxObservedMs = nowMs
     session.lastSeenAt = nowMs
-    this._stage({ t: 'session-upsert', sid: session.sid, session: clone(session) })
+    if (!this.readOnly) this._stage({ t: 'session-upsert', sid: session.sid, session: clone(session) })
   }
 
   // ---------- day ledgers ----------
   ensureDay(sid, campaignId, day, nowMs) {
+    this._assertWritable()
     const key = dayKeyOf(sid, campaignId, day)
     let record = this.days.get(key)
     if (!record) record = { chancesUsed: 0, createdAt: nowMs, updatedAt: nowMs }
@@ -673,6 +1038,7 @@ export class FileStore extends MemoryStore {
 
   // ---------- cards ----------
   putCard(record, nowMs) {
+    this._assertWritable()
     record.updatedAt = nowMs
     const stored = clone(record)
     this.cards.set(cardKeyOf(record.sid, record.campaignId, record.day, record.cardId), stored)
@@ -705,6 +1071,7 @@ export class FileStore extends MemoryStore {
 
   // ---------- idempotency ----------
   putIdempotency(sid, scope, key, entry) {
+    this._assertWritable()
     const stored = clone(entry)
     this.idempotency.set(idemKeyOf(sid, scope, key), stored)
     this._stage({ t: 'idem-upsert', sid, scope, key, entry: clone(stored) })
@@ -712,6 +1079,7 @@ export class FileStore extends MemoryStore {
 
   // ---------- claims / meta ----------
   addClaim(dedupKey) {
+    this._assertWritable()
     if (!this.claimsLedger.has(dedupKey)) {
       this.claimsLedger.add(dedupKey)
       this._stage({ t: 'claim-add', dedupKey })
@@ -719,6 +1087,7 @@ export class FileStore extends MemoryStore {
   }
 
   setMeta(key, value) {
+    this._assertWritable()
     this.meta.set(key, clone(value))
     this._stage({ t: 'meta-set', key, value: clone(value) })
   }
@@ -731,6 +1100,7 @@ export class FileStore extends MemoryStore {
 
   // ---------- event log ----------
   appendEvent(type, payload, nowMs) {
+    this._assertWritable()
     const event = { seq: this.events.length + 1, type, at: nowMs, ...payload }
     this.events.push(event)
     this._stage({ t: 'event', event: clone(event) })
@@ -766,6 +1136,7 @@ export class FileStore extends MemoryStore {
         epoch: this.epoch,
         data: { group, op: clone(op) },
       }
+      if (this.formatVersion >= 2) applyRec.v = this.formatVersion
       applyRec.hash = hashRecord(applyRec)
       prev = applyRec.hash
       encoded.push(encodeRecord(applyRec))
@@ -779,6 +1150,7 @@ export class FileStore extends MemoryStore {
       epoch: this.epoch,
       data: { group, n: ops.length },
     }
+    if (this.formatVersion >= 2) commitRec.v = this.formatVersion
     commitRec.hash = hashRecord(commitRec)
     encoded.push(encodeRecord(commitRec))
     const payload = encoded.join('')
@@ -802,9 +1174,9 @@ export class FileStore extends MemoryStore {
 
     // 窗口 A 注入点：日志已 write+fsync，但进程在内存事务“提交返回”前死亡
     if (this._fault('crashAfterWrite')) {
-      // 模拟进程死亡：丢弃工作暂存（旧实例不再参与任何后续写），避免该
-      // 实例被测试继续使用时重复 flush 同一条事务。
-      this.staged = []
+      // 模拟进程死亡：释放锁与 fd（旧实例不再参与任何后续写），避免该
+      // 实例被测试继续使用时重复 flush 同一条事务或继续持有 leader 锁。
+      this._simulateProcessDeath()
       throw new SimulatedCrash('log-written-memory-not-committed')
     }
 
@@ -840,7 +1212,7 @@ export class FileStore extends MemoryStore {
     const nextEpoch = this.epoch + 1
     const snapshotId = `snap-${nextEpoch}-${this.tipHash.slice(0, 16)}`
     const snapshot = {
-      format: SNAPSHOT_FORMAT,
+      format: this.formatVersion >= 2 ? SNAPSHOT_FORMAT_V2 : SNAPSHOT_FORMAT_V1,
       epoch: nextEpoch,
       snapshotId,
       createdAt: Date.now(),
@@ -853,7 +1225,7 @@ export class FileStore extends MemoryStore {
       snapshotId,
       prevEpochTip: this.tipHash,
       prevEpochRecords: this.totalRecords,
-    })
+    }, this.formatVersion)
     snapshot.genesisHash = genesis.hash
     const checksum = sha256Hex(canonicalJSON(snapshot))
     const snapshotFile = `${canonicalJSON(snapshot)}\n${checksum}\n`
@@ -868,6 +1240,7 @@ export class FileStore extends MemoryStore {
     // 测试窗口：临时快照已 fsync、尚未 rename（真实进程在此死亡时，
     // snapshot.json 仍不存在、旧日志完整，tmp 为可清理的孤儿）
     if (this._fault('crashAfterSnapshotWrite')) {
+      this._simulateProcessDeath()
       throw new SimulatedCrash('snapshot-written-not-swapped')
     }
     renameSync(this.tmpSnapshotPath, this.snapshotPath)
@@ -902,6 +1275,161 @@ export class FileStore extends MemoryStore {
     this.logBytes = Buffer.byteLength(newLog)
   }
 
+  // ---------- 存储格式 v1 → v2 在线迁移 ----------
+  /**
+   * 迁移 = 以 v1 链尖为锚的 v2 快照压缩 + 链上 MIGRATE 记录：
+   *   snapshot.json(v2, tipHash=v1Tip) + events.log(v2: GENESIS, MIGRATE)
+   * 提交点 = events.log 首条记录变为 v2；v1 原文件保留为 *.v1.bak 审计轨迹。
+   * 崩溃窗口全部由 _adjudicateMigration 在下次启动裁决（回滚 v1 或补完 v2）。
+   */
+  _migrateToV2() {
+    const v1Epoch = this.epoch
+    const v1Tip = this.tipHash
+    const v1Records = this.totalRecords
+    const nextEpoch = v1Epoch + 1
+    const snapshotId = `snap-${nextEpoch}-${v1Tip.slice(0, 16)}`
+    const genesis = genesisRecord(nextEpoch, {
+      snapshotId,
+      prevEpochTip: v1Tip,
+      prevEpochRecords: v1Records,
+    }, 2)
+    const migrateRec = {
+      v: 2,
+      seq: 2,
+      kind: 'MIGRATE',
+      prevHash: genesis.hash,
+      hash: null,
+      epoch: nextEpoch,
+      data: {
+        t: 'format-migration',
+        from: 1,
+        to: 2,
+        at: Date.now(),
+        v1Epoch,
+        v1TipHash: v1Tip,
+        v1Records,
+      },
+    }
+    migrateRec.hash = hashRecord(migrateRec)
+    const snapshot = {
+      format: SNAPSHOT_FORMAT_V2,
+      epoch: nextEpoch,
+      snapshotId,
+      createdAt: Date.now(),
+      tipHash: v1Tip,
+      records: v1Records,
+      genesisHash: genesis.hash,
+      state: this._dumpState(),
+    }
+    const snapshotFile = `${canonicalJSON(snapshot)}\n${sha256Hex(canonicalJSON(snapshot))}\n`
+    const logFile = encodeRecord(genesis) + encodeRecord(migrateRec)
+
+    const tmpLog = join(this.dir, TMP_V2_LOG)
+    const tmpSnapshot = join(this.dir, TMP_V2_SNAPSHOT)
+    // 迁移期间不追加：先关 fd，完成后以新日志重开
+    if (this.fd !== null) {
+      try {
+        closeSync(this.fd)
+      } catch {
+        // fd 失效不阻断迁移
+      }
+      this.fd = null
+    }
+    writeFileSync(tmpSnapshot, snapshotFile)
+    fsyncFile(tmpSnapshot)
+    writeFileSync(tmpLog, logFile)
+    fsyncFile(tmpLog)
+    // 提交序列：v1 改名备份 → v2 落位（任何中间点崩溃都可裁决，见类注释）
+    renameSync(this.logPath, join(this.dir, LOG_V1_BACKUP))
+    try {
+      renameSync(this.snapshotPath, join(this.dir, SNAPSHOT_V1_BACKUP))
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    renameSync(tmpLog, this.logPath)
+    renameSync(tmpSnapshot, this.snapshotPath)
+    fsyncDir(this.dir)
+    this.fd = openSync(this.logPath, 'a')
+    fsyncSync(this.fd)
+
+    this.epoch = nextEpoch
+    this.seq = 2
+    this.tipHash = migrateRec.hash
+    this.totalRecords = v1Records + 2
+    this.logBytes = Buffer.byteLength(logFile)
+    this.diskVersion = 2
+    this.migrations = [{
+      seq: 2,
+      at: migrateRec.data.at,
+      from: 1,
+      to: 2,
+      v1TipHash: v1Tip,
+      v1Records,
+    }]
+    this._logWarn('format-migrated', { from: 1, to: 2, v1TipHash: v1Tip, v1Records })
+  }
+
+  /**
+   * 启动裁决（leader 拿锁后、_recover 前）：把迁移崩溃窗口收敛到可判定状态。
+   * - events.log 缺失但 v1 备份在 → 崩溃于“v1 已改名、v2 未落位”：完整回滚 v1；
+   * - events.log 已是 v2 → 已越过提交点：补装 v2 快照（若尚未替换）即完成；
+   * - 其余（纯 v1 / 全新目录）→ 清理未遂临时文件，交给正常恢复/迁移流程。
+   */
+  _adjudicateMigration() {
+    const logBackup = join(this.dir, LOG_V1_BACKUP)
+    const snapshotBackup = join(this.dir, SNAPSHOT_V1_BACKUP)
+    const tmpLog = join(this.dir, TMP_V2_LOG)
+    const tmpSnapshot = join(this.dir, TMP_V2_SNAPSHOT)
+    if (!existsSync(this.logPath) && existsSync(logBackup)) {
+      try {
+        renameSync(logBackup, this.logPath)
+      } catch {
+        // 回滚失败则保持现状：replay 按空日志 + 快照处理，verify 会报异常
+      }
+      if (!existsSync(this.snapshotPath) && existsSync(snapshotBackup)) {
+        try {
+          renameSync(snapshotBackup, this.snapshotPath)
+        } catch {
+          // 同上
+        }
+      }
+      rmSync(tmpLog, { force: true })
+      rmSync(tmpSnapshot, { force: true })
+      return
+    }
+    if (existsSync(this.logPath) && this._logHeadVersion() === 2) {
+      if (existsSync(tmpSnapshot)) {
+        const current = readSnapshot(this.snapshotPath)
+        if (current.status !== 'ok' || current.version !== 2) {
+          try {
+            renameSync(tmpSnapshot, this.snapshotPath)
+          } catch {
+            // 补装失败：replay 会报 snapshot-log-format-mismatch，verify 判负可裁决
+          }
+        } else {
+          rmSync(tmpSnapshot, { force: true })
+        }
+      }
+      rmSync(tmpLog, { force: true })
+      return
+    }
+    rmSync(tmpLog, { force: true })
+    rmSync(tmpSnapshot, { force: true })
+  }
+
+  /** 日志首条记录的格式版本（无法解析视为 v1；空/缺失返回 null） */
+  _logHeadVersion() {
+    try {
+      const buffer = readFileSync(this.logPath)
+      const lineEnd = buffer.indexOf(0x0a)
+      if (lineEnd <= 0) return null
+      const rec = decodeLine(buffer.slice(0, lineEnd).toString('utf8'))
+      return rec.v ?? 1
+    } catch {
+      return null
+    }
+  }
+
   // ---------- 审计 ----------
   /** 规范化可比较状态（剔除已过期幂等键，避免 TTL 造成伪分叉） */
   _dumpState(nowMs = Date.now()) {
@@ -921,6 +1449,8 @@ export class FileStore extends MemoryStore {
   }
 
   verifyAudit(nowMs = Date.now()) {
+    // follower 先跟上 leader 最新提交再校验（不重启观察新提交的审计语义）
+    if (this.role === 'follower') this.refresh()
     if (!this.persistent) {
       // 降级态：磁盘不再追加，无法持续审计；明确透出而非伪装 ok
       return {
@@ -955,7 +1485,7 @@ export class FileStore extends MemoryStore {
         anomalies.push(item)
       }
     }
-    let ok = !disk.truncated
+    let ok = !disk.truncated && !disk.formatConflict
     if (disk.firstBrokenSeq !== undefined && disk.truncated) ok = false
 
     const liveDump = canonicalJSON(this._dumpState(nowMs))
@@ -977,6 +1507,8 @@ export class FileStore extends MemoryStore {
       entries: disk.entries,
       firstBrokenSeq: disk.firstBrokenSeq,
       anomalies,
+      format: disk.logVersion ?? disk.snapshotVersion ?? this.diskVersion ?? this.formatVersion,
+      migrations: disk.migrations,
     }
   }
 }

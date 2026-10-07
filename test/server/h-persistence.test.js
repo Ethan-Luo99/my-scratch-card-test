@@ -419,7 +419,7 @@ test('P7 快照压缩后哈希链从新创世重建：verify 全量校验、状�
   // 快照已生成，日志只剩锚定的新创世
   const snapshotFile = readFileSync(join(dir, 'snapshot.json'), 'utf8').replace(/\s+$/, '')
   const snapshot = JSON.parse(snapshotFile.slice(0, snapshotFile.lastIndexOf('\n')))
-  assert.equal(snapshot.format, 'scratch-snapshot-v1')
+  assert.equal(snapshot.format, 'scratch-snapshot-v2')
   assert.equal(snapshot.epoch, 1)
   const lines = logLines(dir)
   assert.equal(lines.length, 1)

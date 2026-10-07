@@ -109,7 +109,11 @@ export function createServerApp(options = {}) {
       if (method === 'GET' && matchPath(pathname, '/healthz')) {
         return sendJson(res, {
           status: 200,
-          body: { ...engine.health(), isPersistent: store.isPersistent !== false },
+          body: {
+            ...engine.health(),
+            isPersistent: store.isPersistent !== false,
+            ...(typeof store.role === 'string' ? { role: store.role } : {}),
+          },
         })
       }
       if (method === 'GET' && matchPath(pathname, '/verification-key')) {
@@ -199,6 +203,10 @@ export function createServerApp(options = {}) {
     } catch (error) {
       if (error instanceof EngineError) {
         return sendJson(res, { status: error.status, body: { error: error.error, message: error.message } })
+      }
+      if (error && error.code === 'read-only') {
+        // follower 实例上的写请求：明确的只读拒绝（数据目录由 leader 独占写）
+        return sendJson(res, { status: 423, body: { error: 'read-only', message: error.message } })
       }
       if (logger) logger({ level: 'error', event: 'unhandled', message: String(error?.message ?? error) })
       return sendJson(res, { status: 500, body: { error: 'internal-error' } })
